@@ -475,6 +475,31 @@ test_brief_names_the_product_of_a_linked_project() {
   pass "ship and scout briefs name a linked project's product, root, and sibling projects; an unlinked project gets none"
 }
 
+test_brief_refuses_a_manifest_target_off_shape() {
+  local sub root good target err
+  new_world brief-off-shape
+  make_org_project xelta
+  sub="$W/sub"
+  seed design "$sub" --link-root "$ORG" "alpha=$ORG/xelta/code/alpha" >/dev/null 2>&1 || fail "could not seed the product home"
+  root=$(cd "$ORG" && pwd -P)
+  good="$W/good-manifest"
+  cp "$sub/config/linked-projects" "$good"
+  for target in "$root/xelta/code/g1/g2/alpha" "$root/xelta/alpha" "$W/outside/xelta/code/alpha"; do
+    sed "s|^link.alpha=.*|link.alpha=$target|" "$good" > "$sub/config/linked-projects"
+    err="$W/off-shape.err"
+    rm -rf "$sub/data/ship-alpha"
+    if FM_HOME="$sub" "$ROOT/bin/fm-brief.sh" ship-alpha alpha --mode direct-PR >/dev/null 2>"$err"; then
+      fail "brief scaffolded although the manifest target $target is off shape"
+    fi
+    assert_grep "is not <link_root>/<project-dir>/code/[<group>/]<repo>: $target" "$err" "off-shape refusal did not name the target $target"
+    assert_absent "$sub/data/ship-alpha/brief.md" "off-shape refusal wrote a brief for $target"
+  done
+  cp "$good" "$sub/config/linked-projects"
+  FM_HOME="$sub" "$ROOT/bin/fm-brief.sh" ship-alpha alpha --mode direct-PR >/dev/null || fail "brief failed once the manifest was repaired"
+  assert_grep '# Product context (read-only)' "$sub/data/ship-alpha/brief.md" "repaired manifest brief has no product section"
+  pass "a manifest target off the accepted shapes stops the brief before anything is written"
+}
+
 test_home_without_link_root_is_unchanged() {
   local sub err
   new_world no-link-root
@@ -508,4 +533,5 @@ test_rollback_refuses_a_retargeted_link
 test_retirement_keeps_every_linked_repo
 test_forced_retirement_keeps_every_linked_repo
 test_brief_names_the_product_of_a_linked_project
+test_brief_refuses_a_manifest_target_off_shape
 test_home_without_link_root_is_unchanged

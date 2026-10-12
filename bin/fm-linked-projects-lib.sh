@@ -117,9 +117,10 @@ fm_lp_overlaps() {
 
 # Parse <home>'s manifest into FM_LP_ROOT and FM_LP_ENTRIES ("<project>\t<target>"
 # lines). Returns 0 when parsed, 1 when absent, and 2 with FM_LP_ERROR when unsafe
-# or malformed.
+# or malformed, including a target outside the link root or off the accepted
+# shapes; a shape error leaves every parsed entry in FM_LP_ENTRIES.
 fm_lp_manifest_read() {
-  local home=$1 file line key value project schema='' schema_count=0 root_count=0 seen
+  local home=$1 file line key value project schema='' schema_count=0 root_count=0 seen name target
   FM_LP_ROOT=
   FM_LP_ENTRIES=
   FM_LP_ERROR=
@@ -202,6 +203,16 @@ fm_lp_manifest_read() {
       return 2
       ;;
   esac
+  while IFS='	' read -r name target; do
+    [ -n "$name" ] || continue
+    case "$target" in
+      "${FM_LP_ROOT%/}"/*) fm_lp_shape_valid "${target#"${FM_LP_ROOT%/}"/}" && continue ;;
+    esac
+    FM_LP_ERROR="linked project $name target in $file is not <link_root>/<project-dir>/code/[<group>/]<repo>: $target"
+    return 2
+  done <<EOF
+$FM_LP_ENTRIES
+EOF
   return 0
 }
 
@@ -334,14 +345,14 @@ fm_lp_protected_paths() {
       dest=$(fm_lp_link_target "$entry") || continue
       printf 'linked project of firstmate home %s\t%s\n' "$home" "$dest"
     done
-    if fm_lp_manifest_read "$home" 2>/dev/null; then
-      while IFS='	' read -r name target; do
-        [ -n "$name" ] || continue
-        printf 'linked project of firstmate home %s\t%s\n' "$home" "$(fm_lp_canonical "$target")"
-      done <<EOF
+    # A malformed manifest still protects every target it parsed.
+    fm_lp_manifest_read "$home" 2>/dev/null || true
+    while IFS='	' read -r name target; do
+      [ -n "$name" ] || continue
+      printf 'linked project of firstmate home %s\t%s\n' "$home" "$(fm_lp_canonical "$target")"
+    done <<EOF
 $FM_LP_ENTRIES
 EOF
-    fi
   done <<EOF
 $(fm_lp_known_homes "$active")
 EOF
