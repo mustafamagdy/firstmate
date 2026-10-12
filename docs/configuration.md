@@ -743,12 +743,20 @@ The seeded home's `data/charter.md` owns the standard secondmate lifecycle and e
 
 A local secondmate home may keep project repositories outside the home, in the standard workspace layout `<link-root>/<project-dir>/code/<repo>`, reached through links at `projects/<project>`.
 A product made of many repositories may group them one level deeper, as `<link-root>/<project-dir>/code/<group>/<repo>`; the group level is optional, never deeper, and grouped and ungrouped repositories may be mixed in one product.
-Seed one with `fm-home-seed.sh <id> <home|-> --link-root <org-dir> <project>=<absolute repo path>...`; linked and ordinary cloned projects may be mixed in one seed.
+Seed one with `fm-home-seed.sh <id> <home|-> --link-root <org-dir> [--mode <no-mistakes|direct-PR> [--yolo]] <project>=<absolute repo path>...`; linked and ordinary cloned projects may be mixed in one seed.
 The home records its one link root and every linked target in its gitignored `config/linked-projects` manifest, which is never inherited from the primary.
 A home without that manifest has no link root and behaves exactly as before, and a home that already declares a link root refuses a different one.
 
-A missing target is cloned, but only into an existing `code/` or `code/<group>/` folder: seeding never creates the project root, `code/`, a group directory, `README.md`, `docs/`, or `data/`.
-An existing target is adopted only when its origin matches, and project registry entries, delivery modes, and no-mistakes initialization follow the same rules as cloned projects.
+A linked project needs no clone or registry entry in the active home.
+When the active home has a clone of the project, that clone's origin is the project's origin: an existing target is adopted only when its origin matches, and a missing target is cloned from it.
+Otherwise an existing target that is the root of a git repository with an origin is adopted with its own origin, and a missing target is refused because there is no origin to clone it from.
+A missing target is cloned only into an existing `code/` or `code/<group>/` folder: seeding never creates the project root, `code/`, a group directory, `README.md`, `docs/`, or `data/`.
+
+A linked project the active home registers keeps its registered `data/projects.md` row.
+Otherwise its posture comes from the row the secondmate home already holds, so a re-seed that adds projects keeps every recorded posture, and then from `--mode no-mistakes` or `--mode direct-PR`, with `--yolo` for merge authority.
+With none of them the seed refuses rather than defaulting, and `local-only` is refused from every source.
+A `--mode` row uses the standard registry syntax, `- <project> [<mode>[ +yolo][ forge=azure-devops]] - linked project (added <date>)`, bound to `forge=azure-devops` when `bin/fm-forge-detect.sh` finds the target's origin on Azure DevOps, which supports `direct-PR` only; any other proposed forge binding is refused until the active home registers the project with its confirmed binding.
+No-mistakes initialization follows the same rules as cloned projects: only a newly cloned target is initialized, and an uninitialized preexisting repository is refused, never mutated.
 
 Containment is enforced in code at seed time and at rollback.
 A target must resolve to exactly one of those shapes inside the link root, and must not equal, contain, or sit inside the firstmate code root, the main or active home, the secondmate home, any other local secondmate home reachable through the registries, any other home's linked target, or another linked target in the same home.

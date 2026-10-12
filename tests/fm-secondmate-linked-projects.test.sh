@@ -5,8 +5,9 @@
 # adopt, grouped and ungrouped), every containment refusal, rollback removing
 # only a cloned repository directory, symlink retargeting between seed and
 # rollback, retirement leaving every linked repository in place, consumers that
-# work through the link, the product context in generated briefs, and unchanged
-# behavior for a home with no link root.
+# work through the link, the product context in generated briefs, unchanged
+# behavior for a home with no link root, and adopting a target the active home
+# has no clone of under an explicit --mode posture.
 set -u
 
 # shellcheck source=tests/secondmate-helpers.sh disable=SC1091
@@ -314,6 +315,136 @@ EOF
   pass "seed refuses targets outside the root, off-shape, missing code/ or group, or overlapping any home, code root, or linked target"
 }
 
+# --- adopting a target the active home has no clone of ----------------------
+
+# An existing repository in the org layout with an origin no active-home clone
+# names, as the real org checkouts are.
+make_org_repo() {  # <path> <origin-url>
+  fm_git_init_commit "$1"
+  git -C "$1" remote add origin "$2"
+}
+
+sub_posture() {  # <home> <project> [--forge]
+  local flag=${3:-}
+  FM_ROOT_OVERRIDE='' FM_DATA_OVERRIDE='' FM_HOME="$1" "$ROOT/bin/fm-project-mode.sh" ${flag:+"$flag"} "$2"
+}
+
+test_seed_adopts_targets_without_an_active_home_clone() {
+  local sub gh ado out root
+  new_world adopt-unregistered
+  make_org_project xelta
+  mkdir -p "$ORG/xelta/code/platform" "$ORG/xelta/code/v2"
+  gh="$ORG/xelta/code/platform/web"
+  ado="$ORG/xelta/code/v2/api"
+  make_org_repo "$gh" "git@github.com:matchbest-group/web.git"
+  make_org_repo "$ado" "https://match-best@dev.azure.com/match-best/xelta-v2/_git/api"
+  sub="$W/sub"
+  out=$(seed design "$sub" --link-root "$ORG" --mode direct-PR "web=$gh" "api=$ado" 2>&1) || fail "adopting seed failed: $out"
+  assert_absent "$MAIN/projects/web" "adoption cloned into the active home"
+  assert_no_grep '- web' "$MAIN/data/projects.md" "adoption registered the project in the active home"
+  root=$(cd "$ORG" && pwd -P)
+  [ "$(cd "$sub/projects/web" && pwd -P)" = "$root/xelta/code/platform/web" ] || fail "projects/web does not resolve to the adopted repo"
+  [ "$(cd "$sub/projects/api" && pwd -P)" = "$root/xelta/code/v2/api" ] || fail "projects/api does not resolve to the adopted repo"
+  [ "$(git -C "$gh" remote get-url origin)" = "git@github.com:matchbest-group/web.git" ] || fail "adoption changed the target's origin"
+  assert_grep "link.api=$root/xelta/code/v2/api" "$sub/config/linked-projects" "manifest did not record the adopted target"
+  assert_grep '- web [direct-PR] - linked project (added ' "$sub/data/projects.md" "GitHub-like adopted row is not the standard direct-PR row"
+  assert_grep '- api [direct-PR forge=azure-devops] - linked project (added ' "$sub/data/projects.md" "Azure DevOps adopted row lacks forge=azure-devops"
+  [ "$(sub_posture "$sub" web)" = "direct-PR off" ] || fail "GitHub-like adopted project does not resolve to direct-PR off"
+  [ "$(sub_posture "$sub" web --forge)" = none ] || fail "GitHub-like adopted project resolves to a forge"
+  [ "$(sub_posture "$sub" api)" = "direct-PR off" ] || fail "Azure DevOps adopted project does not resolve to direct-PR off"
+  [ "$(sub_posture "$sub" api --forge)" = azure-devops ] || fail "Azure DevOps adopted project does not resolve to forge azure-devops"
+  assert_grep 'projects: web, api' "$MAIN/data/secondmates.md" "route did not list the adopted projects"
+  FM_HOME="$MAIN" "$ROOT/bin/fm-home-seed.sh" validate >/dev/null || fail "registry validation failed for an adopting home"
+
+  # Re-seeding adds a project and keeps each recorded posture, with or without --mode.
+  make_org_repo "$ORG/xelta/code/platform/admin" "git@github.com:matchbest-group/admin.git"
+  git -C "$ORG/xelta/code/platform/admin" remote add no-mistakes "file://$W/nm.git"
+  out=$(seed design "$sub" --link-root "$ORG" --mode no-mistakes --yolo "web=$gh" "api=$ado" "admin=$ORG/xelta/code/platform/admin" 2>&1) \
+    || fail "re-seed adding a project failed: $out"
+  assert_grep '- web [direct-PR] - linked project' "$sub/data/projects.md" "re-seed --mode rewrote a recorded posture"
+  assert_grep '- api [direct-PR forge=azure-devops] - linked project' "$sub/data/projects.md" "re-seed lost the recorded forge"
+  assert_grep '- admin [no-mistakes +yolo] - linked project' "$sub/data/projects.md" "re-seed did not record the new project's --mode posture"
+  [ "$(sub_posture "$sub" admin)" = "no-mistakes on" ] || fail "--mode no-mistakes --yolo does not resolve to no-mistakes on"
+  [ "$(grep -c '^- ' "$sub/data/projects.md")" -eq 3 ] || fail "re-seed duplicated registry rows: $(cat "$sub/data/projects.md")"
+  out=$(seed design "$sub" "web=$gh" "api=$ado" "admin=$ORG/xelta/code/platform/admin" 2>&1) \
+    || fail "re-seed without --mode failed for already recorded projects: $out"
+  assert_grep 'projects: web, api, admin' "$MAIN/data/secondmates.md" "re-seed did not list every project"
+  assert_org_project_intact xelta "adopting seed"
+  pass "seed adopts GitHub-like and Azure DevOps-like targets with no active-home clone, writes standard rows, and re-seeds keep them"
+}
+
+test_seed_refuses_an_adopted_project_without_a_posture() {
+  local gh
+  new_world adopt-no-posture
+  make_org_project xelta
+  gh="$ORG/xelta/code/web"
+  make_org_repo "$gh" "git@github.com:matchbest-group/web.git"
+  expect_seed_refusal "an unregistered linked project without --mode" "pass --mode no-mistakes or --mode direct-PR" \
+    --link-root "$ORG" "web=$gh"
+  expect_seed_refusal "--mode local-only" "--mode local-only is refused" \
+    --link-root "$ORG" --mode local-only "web=$gh"
+  expect_seed_refusal "--yolo without --mode" "--yolo applies only with --mode" \
+    --link-root "$ORG" --yolo "web=$gh"
+  make_org_repo "$ORG/xelta/code/api" "https://dev.azure.com/match-best/xelta-v2/_git/api"
+  expect_seed_refusal "an Azure DevOps target with --mode no-mistakes" "supports only direct-PR" \
+    --link-root "$ORG" --mode no-mistakes "api=$ORG/xelta/code/api"
+  assert_present "$gh/.git" "a posture refusal removed the adopted repository"
+  assert_present "$ORG/xelta/code/api/.git" "an Azure DevOps refusal removed the adopted repository"
+  assert_org_project_intact xelta "posture refusals"
+  pass "seed refuses an unregistered linked project with no --mode, --mode local-only, and Azure DevOps with no-mistakes"
+}
+
+test_seed_refuses_a_missing_target_without_an_origin_source() {
+  new_world adopt-missing
+  make_org_project xelta
+  expect_seed_refusal "a missing target the active home has no clone of" "no origin to clone it from" \
+    --link-root "$ORG" --mode direct-PR "web=$ORG/xelta/code/web"
+  assert_absent "$ORG/xelta/code/web" "a missing-origin refusal created the target"
+  fm_git_init_commit "$ORG/xelta/code/bare"
+  expect_seed_refusal "an existing target with no origin" "has no origin remote" \
+    --link-root "$ORG" --mode direct-PR "bare=$ORG/xelta/code/bare"
+  assert_present "$ORG/xelta/code/bare/.git" "a no-origin refusal removed the existing repository"
+  assert_org_project_intact xelta "missing-origin refusals"
+  pass "seed refuses a missing target with no active-home clone to clone from, and a target with no origin"
+}
+
+test_seed_mode_does_not_override_an_active_registration() {
+  local sub target out
+  new_world adopt-registered
+  make_org_project alpha-proj
+  target="$ORG/alpha-proj/code/alpha"
+  git clone --quiet "$(git -C "$MAIN/projects/alpha" remote get-url origin)" "$target"
+  sub="$W/sub"
+  out=$(seed design "$sub" --link-root "$ORG" --mode no-mistakes --yolo "alpha=$target" 2>&1) || fail "registered linked seed failed: $out"
+  assert_grep '- alpha [direct-PR] - alpha project (added 2026-10-01)' "$sub/data/projects.md" "--mode overrode the active home's registered row"
+  [ "$(sub_posture "$sub" alpha)" = "direct-PR off" ] || fail "registered linked project does not keep its registered posture"
+  assert_no_grep 'linked project' "$sub/data/projects.md" "a registered project got a --mode row"
+  pass "--mode never overrides a project the active home registers"
+}
+
+test_rollback_of_an_adopting_seed_keeps_the_targets() {
+  local sub gh
+  new_world adopt-rollback
+  make_org_project xelta
+  gh="$ORG/xelta/code/web"
+  make_org_repo "$gh" "git@github.com:matchbest-group/web.git"
+  printf 'local scratch\n' > "$gh/.git/fm-adopt-marker"
+  sub="$W/sub"
+  mark_firstmate_home "$sub"
+  if seed design "$sub" --link-root "$ORG" --mode direct-PR "web=$gh" "api=$ORG/xelta/code/api" >/dev/null 2>"$W/rollback.err"; then
+    fail "seed succeeded although a linked target had no origin to clone from"
+  fi
+  assert_grep 'no origin to clone it from' "$W/rollback.err" "rollback seed did not report the missing origin"
+  assert_present "$gh/.git/fm-adopt-marker" "rollback removed or replaced the adopted repository"
+  [ ! -L "$sub/projects/web" ] || fail "rollback left the adopted project's link"
+  assert_absent "$sub/config/linked-projects" "rollback left the manifest it created"
+  assert_absent "$sub/data/projects.md" "rollback left a registry it created"
+  assert_present "$sub/AGENTS.md" "rollback removed the preexisting home"
+  [ ! -f "$MAIN/data/secondmates.md" ] || assert_no_grep '- design ' "$MAIN/data/secondmates.md" "rollback left the route"
+  assert_org_project_intact xelta "adopting rollback"
+  pass "rollback of an adopting seed removes only its links and records; adopted targets survive"
+}
+
 # --- rollback -----------------------------------------------------------------
 
 test_rollback_removes_only_the_cloned_code_repo() {
@@ -535,3 +666,8 @@ test_forced_retirement_keeps_every_linked_repo
 test_brief_names_the_product_of_a_linked_project
 test_brief_refuses_a_manifest_target_off_shape
 test_home_without_link_root_is_unchanged
+test_seed_adopts_targets_without_an_active_home_clone
+test_seed_refuses_an_adopted_project_without_a_posture
+test_seed_refuses_a_missing_target_without_an_origin_source
+test_seed_mode_does_not_override_an_active_registration
+test_rollback_of_an_adopting_seed_keeps_the_targets
