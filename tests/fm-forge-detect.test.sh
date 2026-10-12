@@ -77,6 +77,40 @@ test_detection_writes_nothing() {
   pass "detection reads the clone's config and changes nothing"
 }
 
+test_azure_devops_remotes_propose_azure_devops() {
+  local clone out url host
+  while IFS='|' read -r url host; do
+    [ -n "$url" ] || continue
+    clone=$(new_clone "azure-$host-$RANDOM")
+    git -C "$clone" remote add origin "$url"
+    out=$("$DETECT" "$clone") || fail "detection failed on an Azure DevOps clone"
+    case "$out" in
+      "forge=azure-devops evidence="*"($host)") ;;
+      *) fail "an Azure DevOps origin $url did not propose azure-devops with its host: $out" ;;
+    esac
+  done <<'EOF'
+https://match-best@dev.azure.com/match-best/xelta-v2/_git/api|dev.azure.com
+git@ssh.dev.azure.com:v3/match-best/xelta-v2/api|ssh.dev.azure.com
+ssh://git@ssh.dev.azure.com/v3/match-best/xelta-v2/api|ssh.dev.azure.com
+https://Contoso.VisualStudio.com/Proj/_git/repo|contoso.visualstudio.com
+contoso@vs-ssh.visualstudio.com:v3/contoso/Proj/repo|vs-ssh.visualstudio.com
+EOF
+
+  # A credential embedded in an HTTPS remote never reaches the evidence line.
+  clone=$(new_clone azure-credential)
+  git -C "$clone" remote add origin https://user:s3cr3t-token@dev.azure.com/org/proj/_git/repo
+  out=$("$DETECT" "$clone") || fail "detection failed on a credentialed Azure DevOps remote"
+  assert_not_contains "$out" s3cr3t-token "the evidence line echoed a remote credential"
+  assert_contains "$out" 'https://dev.azure.com/org/proj/_git/repo' "the evidence line did not name the remote"
+
+  # A look-alike host is not Azure DevOps.
+  clone=$(new_clone azure-lookalike)
+  git -C "$clone" remote add origin https://dev.azure.com.example/org/proj/_git/repo
+  out=$("$DETECT" "$clone") || fail "detection failed on a look-alike host"
+  [ "$out" = forge=none ] || fail "a look-alike host proposed a forge: $out"
+  pass "an Azure DevOps origin proposes forge=azure-devops and never echoes a credential"
+}
+
 test_not_a_clone_is_an_error() {
   local out rc
   mkdir -p "$TMP_ROOT/plain-dir"
@@ -90,6 +124,7 @@ test_not_a_clone_is_an_error() {
 test_ssh_port_29418_proposes_gerrit
 test_refs_for_push_refspec_proposes_gerrit
 test_other_remotes_propose_none
+test_azure_devops_remotes_propose_azure_devops
 test_detection_writes_nothing
 test_not_a_clone_is_an_error
 echo "# all fm-forge-detect tests passed"

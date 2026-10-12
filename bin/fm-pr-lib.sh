@@ -5,9 +5,12 @@
 #
 # The stored identity is provider-tagged: provider, url, host, path, number.
 # "path" is the full project path, which is owner/repository on GitHub, an
-# arbitrarily nested group/subgroup/project namespace on GitLab, and an
+# arbitrarily nested group/subgroup/project namespace on GitLab, an
 # arbitrarily nested project name on Gerrit, where "number" is the change
-# number. A GitLab or Gerrit project can sit at any depth, so no
+# number, and on Azure DevOps the URL path between the host and
+# "/pullrequest/": <organization>/<project>/_git/<repository> on dev.azure.com
+# and <project>/_git/<repository> on a legacy <organization>.visualstudio.com
+# host, whose organization is the host's first label. A GitLab or Gerrit project can sit at any depth, so no
 # owner/repository pair can address one and the sidecar carries the whole path
 # instead. Both also run on self-hosted instances, and Gerrit runs nowhere else,
 # so the host is part of that identity rather than a constant. Every consumer re-derives the identity
@@ -95,6 +98,13 @@ FM_PR_RETIRE_RECEIPT_IDENTITY=
 FM_PR_RECORD_STATE=
 FM_PR_RECORD_MERGED=
 FM_PR_POLL_RETIREMENT_REJECTED=
+FM_PR_AZURE_ORG_URL=
+FM_PR_AZURE_PROJECT=
+FM_PR_AZURE_REPO=
+FM_PR_AZURE_OUT=
+FM_PR_AZURE_ERROR=
+FM_PR_AZURE_AUTH_FAILED=false
+FM_PR_AZURE_PR_JSON=
 
 fm_task_id_path_safe() {
   local id=${1-}
@@ -121,13 +131,15 @@ fm_task_id_creation_valid() {
 # change. github.com is refused here even though its shape is otherwise valid:
 # it is GitHub's own host and never another forge's instance, so a URL like
 # https://github.com/o/r/-/merge_requests/1 (a typo'd or spoofed GitHub URL)
-# would otherwise be armed as a watch that can never succeed.
+# would otherwise be armed as a watch that can never succeed. Azure DevOps's own
+# hosts (fm_pr_azure_host_reserved) are refused for the same reason.
 fm_pr_forge_host_valid() {
   local host=${1-} label
   local LC_ALL=C
   local -a labels
   [ "${#host}" -ge 1 ] && [ "${#host}" -le 253 ] || return 1
   [ "$host" != github.com ] || return 1
+  ! fm_pr_azure_host_reserved "$host" || return 1
   case "$host" in
     .*|*.|*..*|*[!a-z0-9.-]*) return 1 ;;
   esac
@@ -188,18 +200,104 @@ fm_pr_gerrit_path_valid() {
   done
 }
 
+# Azure DevOps serves only its own hosts: dev.azure.com, its SSH host, and the
+# legacy <organization>.visualstudio.com form. None of them is ever a GitLab or
+# Gerrit instance, so a look-alike URL on one of them is refused by every other
+# provider's parse instead of being armed as a watch that can never succeed.
+fm_pr_azure_host_reserved() {
+  case "${1-}" in
+    dev.azure.com|*.dev.azure.com|visualstudio.com|*.visualstudio.com) return 0 ;;
+  esac
+  return 1
+}
+
+# An Azure DevOps organization name: letters, digits, and hyphens, starting and
+# ending with a letter or digit, at most 50 characters. <case> is "any" for the
+# dev.azure.com path segment and "lower" for the legacy host label, where a DNS
+# name keeps one canonical lowercase spelling.
+fm_pr_azure_org_valid() {  # <org> <any|lower>
+  local org=${1-} case=${2-any}
+  local LC_ALL=C
+  [ "${#org}" -ge 1 ] && [ "${#org}" -le 50 ] || return 1
+  case "$org" in
+    -*|*-) return 1 ;;
+  esac
+  if [ "$case" = lower ]; then
+    case "$org" in *[!a-z0-9-]*) return 1 ;; esac
+  else
+    case "$org" in *[!A-Za-z0-9-]*) return 1 ;; esac
+  fi
+}
+
+# One Azure DevOps project or repository name as it appears in a web URL. The
+# server's own web URL encodes a space as %20 and nothing else in the accepted
+# set, so a name is letters, digits, ".", "_", "-", and %20-encoded spaces. A
+# leading ".", "_", or "-", a trailing ".", and a leading or trailing space are
+# refused: Azure DevOps rejects the first three as names, a leading hyphen
+# would read as an option to any CLI the name reaches, and the space rules keep
+# one canonical spelling. The decoded name is at most 64 characters.
+fm_pr_azure_name_valid() {  # <encoded-name>
+  local encoded=${1-} decoded rest
+  local LC_ALL=C
+  [ -n "$encoded" ] || return 1
+  # Every %20 is removed before the class test, so any other "%" is refused.
+  rest=${encoded//%20/}
+  case "$rest" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+  decoded=${encoded//%20/ }
+  [ "${#decoded}" -ge 1 ] && [ "${#decoded}" -le 64 ] || return 1
+  case "$decoded" in
+    .*|_*|-*|*.|' '*|*' ') return 1 ;;
+  esac
+}
+
+# Derive the Azure DevOps organization URL and the decoded
+# project and repository names from a stored host and path, revalidating every
+# part. The organization URL is what every az call is pinned to with --org, so
+# an ambient `az devops configure` default can never redirect a read or a merge.
+fm_pr_azure_identity() {  # <host> <path>
+  local host=${1-} path=${2-} org project repo pattern
+  local LC_ALL=C
+  FM_PR_AZURE_ORG_URL=
+  FM_PR_AZURE_PROJECT=
+  FM_PR_AZURE_REPO=
+  if [ "$host" = dev.azure.com ]; then
+    pattern='^([^/]+)/([^/]+)/_git/([^/]+)$'
+    [[ "$path" =~ $pattern ]] || return 1
+    org=${BASH_REMATCH[1]}
+    project=${BASH_REMATCH[2]}
+    repo=${BASH_REMATCH[3]}
+    fm_pr_azure_org_valid "$org" any || return 1
+    FM_PR_AZURE_ORG_URL="https://dev.azure.com/$org"
+  else
+    case "$host" in
+      *.visualstudio.com) org=${host%.visualstudio.com} ;;
+      *) return 1 ;;
+    esac
+    fm_pr_azure_org_valid "$org" lower || return 1
+    pattern='^([^/]+)/_git/([^/]+)$'
+    [[ "$path" =~ $pattern ]] || return 1
+    project=${BASH_REMATCH[1]}
+    repo=${BASH_REMATCH[2]}
+    FM_PR_AZURE_ORG_URL="https://$host"
+  fi
+  fm_pr_azure_name_valid "$project" || return 1
+  fm_pr_azure_name_valid "$repo" || return 1
+  FM_PR_AZURE_PROJECT=${project//%20/ }
+  FM_PR_AZURE_REPO=${repo//%20/ }
+}
+
 # Parse a canonical pull request, merge request, or Gerrit change URL into the
 # provider-tagged identity. Validation is strict and per provider: the GitHub
-# username and repository rules are unchanged, and GitLab and Gerrit each get
-# their own namespace rules rather than a loosened GitHub rule.
+# username and repository rules are unchanged, and GitLab, Gerrit, and Azure
+# DevOps each get their own namespace rules rather than a loosened GitHub rule.
 #
 # FM_PR_OWNER and FM_PR_REPO are additionally set for github because
-# bin/fm-pr-merge.sh addresses GitHub by owner/repository. A gitlab or gerrit
-# URL leaves them empty, and those paths address the project by FM_PR_HOST and
-# FM_PR_PATH instead, so a change on any instance resolves without a hardcoded
-# host.
+# bin/fm-pr-merge.sh addresses GitHub by owner/repository. A gitlab, gerrit, or
+# azure-devops URL leaves them empty, and those paths address the project by
+# FM_PR_HOST and FM_PR_PATH instead (fm_pr_azure_identity for Azure DevOps), so
+# a change on any instance resolves without a hardcoded host.
 fm_pr_url_parse() {
-  local raw=${1-} pattern host path
+  local raw=${1-} pattern host path number
   local LC_ALL=C
   FM_PR_PROVIDER=
   FM_PR_URL=
@@ -222,6 +320,40 @@ fm_pr_url_parse() {
     # shellcheck disable=SC2034
     FM_PR_REPO=${BASH_REMATCH[2]}
     FM_PR_NUMBER=${BASH_REMATCH[3]}
+    return 0
+  fi
+  # An Azure DevOps pull request is
+  # https://dev.azure.com/<org>/<project>/_git/<repository>/pullrequest/<id>, or
+  # https://<org>.visualstudio.com/<project>/_git/<repository>/pullrequest/<id>
+  # on a legacy host. Each name is one segment, because "/" is outside the
+  # segment class, so the literal "/_git/" and "/pullrequest/" cannot shift. A
+  # pull request id is organization-wide, and the project and repository stay in
+  # the identity so every read can refuse a record for another repository.
+  pattern='^https://dev\.azure\.com/([^/]+/[^/]+/_git/[^/]+)/pullrequest/([1-9][0-9]*)$'
+  # fm_pr_azure_identity matches its own patterns, so the captured id is saved
+  # before it runs.
+  if [[ "$raw" =~ $pattern ]]; then
+    path=${BASH_REMATCH[1]}
+    number=${BASH_REMATCH[2]}
+    fm_pr_azure_identity dev.azure.com "$path" || return 1
+    FM_PR_PROVIDER=azure-devops
+    FM_PR_URL=$raw
+    FM_PR_HOST=dev.azure.com
+    FM_PR_PATH=$path
+    FM_PR_NUMBER=$number
+    return 0
+  fi
+  pattern='^https://([a-z0-9-]+\.visualstudio\.com)/([^/]+/_git/[^/]+)/pullrequest/([1-9][0-9]*)$'
+  if [[ "$raw" =~ $pattern ]]; then
+    host=${BASH_REMATCH[1]}
+    path=${BASH_REMATCH[2]}
+    number=${BASH_REMATCH[3]}
+    fm_pr_azure_identity "$host" "$path" || return 1
+    FM_PR_PROVIDER=azure-devops
+    FM_PR_URL=$raw
+    FM_PR_HOST=$host
+    FM_PR_PATH=$path
+    FM_PR_NUMBER=$number
     return 0
   fi
   # The path class contains "/" and "-", so this match is greedy to the last
@@ -1120,6 +1252,180 @@ fm_pr_gerrit_read_revision() {  # <host> <number>
   # Consumed by bin/fm-dod-lib.sh fm_dod_gerrit_change_carries_head.
   # shellcheck disable=SC2034
   FM_PR_RECORD_REVISION=$revision
+}
+
+# Name what an Azure DevOps read or merge is missing before any forge call:
+# az itself, its azure-devops extension (a local lookup, never a network
+# read), and jq, which every Azure DevOps reading parses JSON with. Prints a
+# concrete sentence naming each missing piece and returns 1, or prints nothing.
+fm_pr_azure_missing() {
+  local missing=''
+  if ! command -v az >/dev/null 2>&1; then
+    missing="az (the Azure CLI)"
+  elif ! az extension show --name azure-devops --only-show-errors --output none >/dev/null 2>&1; then
+    missing="the azure-devops extension for az (az extension add --name azure-devops)"
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    missing="${missing:+$missing and }jq"
+  fi
+  [ -n "$missing" ] || return 0
+  printf '%s\n' "$missing"
+  return 1
+}
+
+# Run one az command against the organization the parsed URL names, always
+# pinned with --org so no `az devops configure` default can redirect it, and
+# always with JSON output. Authentication is whatever the environment already
+# provides (`az login`, or AZURE_DEVOPS_EXT_PAT from the organization's
+# .envrc); nothing here reads, stores, or prints a credential, and az's own
+# error text never carries one. On success FM_PR_AZURE_OUT holds stdout. On
+# failure it is empty and FM_PR_AZURE_ERROR holds one concrete sentence, and
+# FM_PR_AZURE_AUTH_FAILED is true when az reported that it could not
+# authenticate, so a caller can name the missing sign-in instead of a vague
+# read failure.
+fm_pr_azure_run() {  # <org-url> <az-args...>
+  local org=$1 err first rc=0
+  shift
+  FM_PR_AZURE_OUT=
+  FM_PR_AZURE_ERROR=
+  FM_PR_AZURE_AUTH_FAILED=false
+  err=$(mktemp "${TMPDIR:-/tmp}/fm-pr-azure.XXXXXX") || {
+    FM_PR_AZURE_ERROR="could not create a temporary file for the az call"
+    return 1
+  }
+  FM_PR_AZURE_OUT=$(az "$@" --org "$org" --only-show-errors --output json 2>"$err") || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$err"
+    return 0
+  fi
+  FM_PR_AZURE_OUT=
+  if grep -qiE 'az (devops )?login|TF400813|unauthori[sz]ed|not authori[sz]ed|authentication|(^|[^0-9])401([^0-9]|$)|personal access token' "$err" 2>/dev/null; then
+    FM_PR_AZURE_AUTH_FAILED=true
+    FM_PR_AZURE_ERROR="Azure DevOps authentication failed for $org: sign in with az login, or set AZURE_DEVOPS_EXT_PAT (normally from the organization's .envrc)"
+  else
+    first=$(grep -m1 -v '^[[:space:]]*$' "$err" 2>/dev/null | tr -d '\r' | cut -c1-300 || true)
+    FM_PR_AZURE_ERROR="az exited $rc${first:+: $first}"
+  fi
+  rm -f "$err"
+  return 1
+}
+
+# Read one Azure DevOps pull request and keep it only when it is exactly the
+# stored identity: the pull request id matches and its repository and project
+# carry the URL's decoded names. A pull request id is organization-wide, so
+# without that comparison a URL naming one repository could act on another
+# repository's pull request with the same id. On success FM_PR_AZURE_PR_JSON
+# holds the compact record; on failure FM_PR_AZURE_ERROR says why.
+fm_pr_azure_read_pr() {  # <host> <path> <number>
+  local host=$1 path=$2 number=$3 match
+  FM_PR_AZURE_PR_JSON=
+  # Consumed by callers that name a failed sign-in (bin/fm-pr-check.sh).
+  # shellcheck disable=SC2034
+  FM_PR_AZURE_AUTH_FAILED=false
+  if ! fm_pr_azure_identity "$host" "$path"; then
+    FM_PR_AZURE_ERROR="invalid Azure DevOps pull request identity"
+    return 1
+  fi
+  case "$number" in
+    ''|*[!0-9]*) FM_PR_AZURE_ERROR="invalid Azure DevOps pull request id"; return 1 ;;
+  esac
+  fm_pr_azure_run "$FM_PR_AZURE_ORG_URL" repos pr show --id "$number" || return 1
+  if ! match=$(printf '%s' "$FM_PR_AZURE_OUT" | jq -c \
+    --argjson id "$number" --arg project "$FM_PR_AZURE_PROJECT" --arg repo "$FM_PR_AZURE_REPO" '
+      if type == "object" and .pullRequestId == $id
+        and (.repository | type) == "object" and .repository.name == $repo
+        and (.repository.project | type) == "object" and .repository.project.name == $project
+      then .
+      else error("not the named pull request")
+      end' 2>/dev/null) || [ -z "$match" ]; then
+    # Consumed by every caller that reports why the read failed.
+    # shellcheck disable=SC2034
+    FM_PR_AZURE_ERROR="Azure DevOps did not return pull request $number of repository \"$FM_PR_AZURE_REPO\" in project \"$FM_PR_AZURE_PROJECT\""
+    return 1
+  fi
+  FM_PR_AZURE_PR_JSON=$match
+}
+
+# The status of one Azure DevOps pull request for bin/fm-crew-state.sh, read
+# through the same exact-identity read as every other consumer. Azure DevOps
+# spells an open pull request active, a merged one completed, and a closed one
+# abandoned.
+fm_pr_azure_read_record() {  # <host> <path> <number>
+  local state merged=false
+  FM_PR_RECORD_STATE=
+  FM_PR_RECORD_MERGED=
+  command -v az >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  fm_pr_azure_read_pr "$1" "$2" "$3" || return 1
+  state=$(printf '%s' "$FM_PR_AZURE_PR_JSON" | jq -r '
+    if (.status | type) == "string" and .status != "" and (.status | test("\n") | not)
+    then .status
+    else error("no status")
+    end' 2>/dev/null) || return 1
+  [ -n "$state" ] || return 1
+  [ "$state" != completed ] || merged=true
+
+  # Consumed by bin/fm-crew-state.sh passed_pr_detail.
+  # shellcheck disable=SC2034
+  FM_PR_RECORD_STATE=$state
+  # Consumed by bin/fm-crew-state.sh passed_pr_detail.
+  # shellcheck disable=SC2034
+  FM_PR_RECORD_MERGED=$merged
+}
+
+# Every Azure DevOps policy evaluation that stands between the pull request
+# and a merge, one tab-separated "<kind>\t<name>\t<status>" line each, from the
+# JSON array `az repos pr policy list` prints. A blocking (required) policy is
+# green only when its status is approved or notApplicable and, for a build
+# policy, its build is neither expired nor for a superseded source commit;
+# rejected and broken are "red", and anything else, including queued, running,
+# or a status that never reported, is "pending", so a required policy that has
+# not reported is never read as passed. A non-blocking (optional) policy never
+# blocks while pending, but a rejected or broken one is "red-optional", so a red
+# pull request is never merged. A policy whose isBlocking is absent is treated
+# as blocking. Exits nonzero when the payload is not an array, so a malformed
+# answer is a failed read and never an empty blocker set.
+fm_pr_azure_policy_blockers() {  # <policy-json>
+  printf '%s' "${1-}" | jq -r '
+    if type != "array" then error("policy evaluations are not an array") else . end
+    | .[]
+    | select(type == "object")
+    | (.configuration // {}) as $c
+    | select($c.isEnabled != false)
+    | (($c.settings.displayName // $c.type.displayName // "unnamed policy")
+        | tostring | gsub("[\\r\\n\\t]"; " ")) as $name
+    | ((.status // "") | tostring) as $s
+    | ((.context.isExpired // false) == true) as $expired
+    | ((.context.buildIsNotCurrent // false) == true) as $stale
+    | if $c.isBlocking != false then
+        if ($s == "approved" or $s == "notApplicable") and ($expired | not) and ($stale | not) then empty
+        elif $s == "rejected" or $s == "broken" then "red\t\($name)\t\($s)"
+        else "pending\t\($name)\t\(if $expired then "expired" elif $stale then "not current" elif $s == "" then "not reported" else $s end)"
+        end
+      else
+        if $s == "rejected" or $s == "broken" then "red-optional\t\($name)\t\($s)" else empty end
+      end
+  ' 2>/dev/null
+}
+
+# Every reviewer whose current vote rejects the pull request or waits for its
+# author, one tab-separated "<rejected|waiting>\t<name>" line each, from one
+# exact pull request record. Required approvals themselves are enforced by the
+# server's own required-reviewer policies, which fm_pr_azure_policy_blockers
+# reads; this reports only the explicit negative votes a merge must not
+# override. Exits nonzero when the reviewer list cannot be read.
+fm_pr_azure_review_blockers() {  # <pull-request-json>
+  printf '%s' "${1-}" | jq -r '
+    (.reviewers // [])
+    | if type != "array" then error("reviewers are not an array") else . end
+    | .[]
+    | select(type == "object")
+    | ((.displayName // .uniqueName // "unnamed reviewer") | tostring | gsub("[\\r\\n\\t]"; " ")) as $name
+    | if .vote == -10 then "rejected\t\($name)"
+      elif .vote == -5 then "waiting\t\($name)"
+      else empty
+      end
+  ' 2>/dev/null
 }
 
 fm_pr_poll_retirement_data_valid() {

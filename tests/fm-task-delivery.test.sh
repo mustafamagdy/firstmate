@@ -1277,6 +1277,69 @@ test_forge_gerrit_changes_what_no_mistakes_means() {
 # green checks on a server that has neither, and a Gerrit brief on an unbound
 # project would publish to a forge the project is not. Both publishing modes
 # compose with the forge; local-only, which publishes nothing, cannot carry it.
+# forge=azure-devops keeps the pull-request shape but changes the tool: the
+# worker opens the pull request with az, and only direct-PR composes, because
+# the no-mistakes pipeline cannot open or watch an Azure DevOps pull request.
+test_forge_azure_devops_ships_direct_pr_through_az() {
+  local home brief out status rec proj fakebin registry
+  home="$TMP_ROOT/forge-azure/home"
+  mkdir -p "$home/data" "$home/state"
+  printf '%s\n' '- fp [direct-PR forge=azure-devops +yolo] - fixture (added 2026-01-01)' > "$home/data/projects.md"
+  out=$(FM_HOME="$home" "$PROJECT_MODE" fp 2>/dev/null)
+  [ "$out" = "direct-PR on" ] || fail "an Azure DevOps direct-PR project lost its posture or yolo: '$out'"
+  out=$(FM_HOME="$home" "$PROJECT_MODE" --forge fp 2>/dev/null)
+  [ "$out" = azure-devops ] || fail "--forge did not report azure-devops: '$out'"
+  for registry in '- fp [no-mistakes forge=azure-devops] - fixture (added 2026-01-01)' \
+    '- fp [forge=azure-devops] - fixture (added 2026-01-01)' \
+    '- fp [no-mistakes-prod-only forge=azure-devops] - fixture (added 2026-01-01)'; do
+    printf '%s\n' "$registry" > "$home/data/projects.md"
+    out=$(FM_HOME="$home" "$PROJECT_MODE" --forge fp 2>&1 >/dev/null)
+    status=$?
+    [ "$status" -eq 3 ] || fail "a pipeline posture with forge=azure-devops did not refuse: $registry"
+    assert_contains "$out" 'Azure DevOps ships only direct-PR' "the refusal did not say why: $registry"
+  done
+
+  FM_HOME="$home" "$BRIEF" forge-azure-a1 api --mode direct-PR --forge azure-devops --base-branch develop >/dev/null \
+    || fail "an Azure DevOps direct-PR brief should scaffold"
+  brief="$home/data/forge-azure-a1/brief.md"
+  grep -qx "Delivery contract: mode=direct-PR forge=azure-devops" "$brief" \
+    || fail "the brief did not record the forge in its delivery contract"
+  # shellcheck disable=SC2016 # Backticks are literal generated Markdown.
+  assert_grep 'run `az repos pr create --source-branch fm/forge-azure-a1 --draft false' "$brief" \
+    "the worker was not told to open the pull request with az repos pr create, ready for review"
+  # shellcheck disable=SC2016 # Backticks are literal generated Markdown.
+  assert_grep '(`--target-branch develop`)' "$brief" "the base branch was not passed as the target branch"
+  # shellcheck disable=SC2016 # Backticks are literal generated Markdown.
+  assert_grep 'the `repository.webUrl` field of that output followed by `/pullrequest/<id>`' "$brief" \
+    "the worker was not told to report the pull request's web URL"
+  # shellcheck disable=SC2016 # Backticks are literal generated Markdown.
+  assert_no_grep 'open a PR with `gh-axi`' "$brief" "the Azure DevOps worker was told to use gh-axi"
+  assert_grep 'never print, store, or pass a credential' "$brief" "the worker was not kept from handling credentials"
+  out=$(FM_HOME="$home" "$BRIEF" forge-azure-a2 api --mode no-mistakes --forge azure-devops 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a no-mistakes Azure DevOps brief scaffolded"
+  assert_contains "$out" "forge=azure-devops ships only mode=direct-PR" "the no-mistakes refusal did not say why"
+  assert_absent "$home/data/forge-azure-a2/brief.md" "the refused brief was still written"
+
+  rec=$(make_home forge-agree-azure "- proj [direct-PR forge=azure-devops] - fixture (added 2026-01-01)")
+  IFS='|' read -r home proj fakebin <<EOF
+$rec
+EOF
+  write_brief "$home" forge-azure-b1 direct-PR
+  out=$(run_spawn "$home" "$fakebin" forge-azure-b1 "$proj" claude --mode direct-PR --yolo off 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "an Azure DevOps project launched on a brief that records no forge"
+  assert_contains "$out" "fm-brief.sh forge-azure-b1 proj --mode direct-PR --forge azure-devops" \
+    "the refusal did not print the Azure DevOps re-scaffold command"
+  FM_HOME="$home" "$BRIEF" forge-azure-b2 proj --mode direct-PR --forge azure-devops >/dev/null \
+    || fail "an Azure DevOps direct-PR brief should scaffold"
+  fill_brief_subsections "$home/data/forge-azure-b2/brief.md" "Open the pull request." "Ship it."
+  out=$(run_spawn "$home" "$fakebin" forge-azure-b2 "$proj" claude --mode direct-PR --yolo on 2>&1)
+  assert_not_contains "$out" "forge mismatch" "an agreeing Azure DevOps brief was reported as drift"
+  assert_not_contains "$out" "--yolo on is refused" "yolo was refused on an Azure DevOps project"
+  pass "forge=azure-devops: direct-PR opens the pull request with az, and pipeline postures are refused with their reason"
+}
+
 test_spawn_requires_the_brief_to_carry_the_registered_forge() {
   local rec home proj fakebin out status
   rec=$(make_home forge-agree-gerrit "- proj [no-mistakes forge=gerrit] - fixture (added 2026-01-01)")
@@ -1641,6 +1704,7 @@ test_project_mode_binds_the_forge_orthogonally
 test_project_mode_refuses_only_a_malformed_forge_binding
 test_forge_gerrit_refuses_yolo
 test_forge_gerrit_changes_what_no_mistakes_means
+test_forge_azure_devops_ships_direct_pr_through_az
 test_forge_gerrit_direct_pr_publishes_one_change
 test_spawn_requires_the_brief_to_carry_the_registered_forge
 test_spawn_requires_the_brief_to_carry_the_selected_branch

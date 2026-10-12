@@ -29,6 +29,13 @@ MR_STALE_HEAD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 JQ_BIN=$(command -v jq) || fail "these tests read glab's JSON with the real jq, which was not found"
 REAL_MV=$(command -v mv) || fail "these tests need mv to simulate a failed poll publish"
 
+# The Azure DevOps fixture: a dev.azure.com pull request whose project name
+# carries a space, so the URL's %20 spelling and the server's decoded name are
+# both exercised. fm_fake_az in tests/lib.sh answers every az call offline.
+AZ_ORG_URL=https://dev.azure.com/match-best
+AZ_URL="$AZ_ORG_URL/Xelta%20V2/_git/api/pullrequest/7"
+AZ_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
 # Build a fresh sandbox for one test case: a state dir with task metadata and a
 # directory for its forge-command mocks. Echoes the case directory.
 make_case() {
@@ -483,6 +490,9 @@ run_pr_merge() {
   FM_TEST_REAL_MV="$REAL_MV" \
   FM_TEST_GLAB_LOG="$case_dir/glab.log" \
   FM_TEST_GLAB_JSON="$case_dir/mr.json" \
+  FM_TEST_AZ_DIR="$case_dir" \
+  FM_PR_AZURE_MERGEABLE_RETRY_DELAY=0 \
+  FM_PR_AZURE_COMPLETE_RETRY_DELAY=0 \
   HOME="${FM_TEST_USER_HOME:-$case_dir/user-home}" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_MERGE" "$@"
@@ -3886,3 +3896,213 @@ test_allow_missing_follows_the_allow_red_rules
 test_required_producer_identity
 test_app_bound_required_status_context_matches_by_name
 test_required_partial_reads_report_all_failures
+
+
+# make_azure_case <name> [<field>=<value> ...]: a case dir with the offline az
+# and a pull request record that satisfies every pre-merge condition unless a
+# field overrides one. Echoes the case dir.
+make_azure_case() {
+  local name=$1 case_dir
+  shift
+  case_dir=$(make_case "$name")
+  fm_fake_az "$case_dir/fakebin"
+  : > "$case_dir/az.log"
+  : > "$case_dir/gh-axi.log"
+  fm_fake_az_pr_json "$case_dir/pr.json" "$@"
+  fm_fake_az_pr_json "$case_dir/pr-post.json" status=completed
+  printf '[%s]\n' "$(fm_fake_az_policy Build approved)" > "$case_dir/policies.json"
+  printf '%s\n' "$case_dir"
+}
+
+azure_merge() {  # <case-dir> [extra args...]; records stdout, stderr, and rc
+  local case_dir=$1
+  shift
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$AZ_URL" "$@" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  AZURE_RC=$?
+  set -e
+}
+
+test_azure_devops_green_pr_completes_with_the_verified_head() {
+  local case_dir line
+  case_dir=$(make_azure_case azure-green)
+  azure_merge "$case_dir"
+  expect_code 0 "$AZURE_RC" "azure-green: a green Azure DevOps pull request should merge"
+  assert_grep "pr=$AZ_URL" "$case_dir/state/task-x1.meta" \
+    "azure-green: pr= was not recorded before merging"
+  [ "$(jq -r '.status + " " + .lastMergeSourceCommit.commitId + " " + .completionOptions.mergeStrategy' \
+    "$case_dir/invoke-body.json")" = "completed $AZ_HEAD squash" ] \
+    || fail "azure-green: the completion did not bind the verified head and squash: $(cat "$case_dir/invoke-body.json")"
+  grep -q -- '--route-parameters project=66666666-7777-8888-9999-000000000000 repositoryId=11111111-2222-3333-4444-555555555555 pullRequestId=7 --http-method PATCH' \
+    "$case_dir/az.log" || fail "azure-green: the completion did not address the read project and repository ids"
+  while IFS= read -r line; do
+    case "$line" in
+      "extension show"*) ;;
+      *) case "$line" in *"--org $AZ_ORG_URL --only-show-errors --output json") ;;
+           *) fail "azure-green: an az call was not pinned to the URL's organization: $line" ;; esac ;;
+    esac
+  done < "$case_dir/az.log"
+  assert_grep "verified: $AZ_URL is completed" "$case_dir/stdout" \
+    "azure-green: the completed state was not verified from the API"
+  [ -e "$case_dir/state/task-x1.pr-poll-merge-notified" ] \
+    || fail "azure-green: a proven completion recorded no landed outcome"
+  [ ! -s "$case_dir/gh-axi.log" ] || fail "azure-green: an Azure DevOps pull request reached the GitHub CLI"
+  pass "fm-pr-merge completes a green Azure DevOps pull request bound to its verified head, then proves it"
+}
+
+test_azure_devops_merge_strategy_flags() {
+  local case_dir
+  case_dir=$(make_azure_case azure-merge-flag)
+  azure_merge "$case_dir" -- --merge
+  expect_code 0 "$AZURE_RC" "azure-merge-flag: --merge should complete"
+  [ "$(jq -r .completionOptions.mergeStrategy "$case_dir/invoke-body.json")" = noFastForward ] \
+    || fail "azure-merge-flag: --merge did not select a merge commit"
+  case_dir=$(make_azure_case azure-unknown-arg)
+  azure_merge "$case_dir" -- --bypass-policy true
+  expect_code 2 "$AZURE_RC" "azure-unknown-arg: an unsupported extra argument should refuse"
+  assert_grep 'only --squash, --merge, or --rebase selects the merge strategy' "$case_dir/stderr" \
+    "azure-unknown-arg: the refusal did not name the accepted flags"
+  assert_absent "$case_dir/invoke-body.json" "azure-unknown-arg: a refused argument still completed"
+  case_dir=$(make_azure_case azure-allow-red)
+  azure_merge "$case_dir" --allow-red Build
+  expect_code 2 "$AZURE_RC" "azure-allow-red: --allow-red should refuse on Azure DevOps"
+  assert_absent "$case_dir/invoke-body.json" "azure-allow-red: a refused waiver still completed"
+  pass "an Azure DevOps merge squashes by default, honours --merge, and refuses every other extra argument"
+}
+
+test_azure_devops_pending_required_policy_refuses() {
+  local case_dir
+  case_dir=$(make_azure_case azure-pending)
+  printf '[%s,%s,%s]\n' "$(fm_fake_az_policy Build queued)" \
+    "$(fm_fake_az_policy 'Work items' '')" \
+    "$(fm_fake_az_policy Coverage approved true '{"isExpired":true}')" > "$case_dir/policies.json"
+  azure_merge "$case_dir"
+  expect_code 1 "$AZURE_RC" "azure-pending: a pending required policy should refuse"
+  assert_grep 'required policy "Build" has not passed (queued)' "$case_dir/stderr" \
+    "azure-pending: a queued required policy was not reported as pending"
+  assert_grep 'required policy "Work items" has not passed (not reported)' "$case_dir/stderr" \
+    "azure-pending: a required policy that never reported was not refused"
+  assert_grep 'required policy "Coverage" has not passed (expired)' "$case_dir/stderr" \
+    "azure-pending: an expired build was read as passed"
+  assert_absent "$case_dir/invoke-body.json" "azure-pending: a pending pull request was completed"
+  assert_grep "pr=$AZ_URL" "$case_dir/state/task-x1.meta" \
+    "azure-pending: the refusal left no PR record or watch behind"
+  pass "a required Azure DevOps policy that is queued, unreported, or expired refuses the merge"
+}
+
+test_azure_devops_failed_policy_refuses() {
+  local case_dir
+  case_dir=$(make_azure_case azure-red)
+  printf '[%s,%s,%s]\n' "$(fm_fake_az_policy Build rejected)" \
+    "$(fm_fake_az_policy Lint rejected false)" \
+    "$(fm_fake_az_policy Docs running false)" > "$case_dir/policies.json"
+  azure_merge "$case_dir"
+  expect_code 1 "$AZURE_RC" "azure-red: a rejected policy should refuse"
+  assert_grep 'required policy "Build" is rejected' "$case_dir/stderr" \
+    "azure-red: a rejected required policy was not reported"
+  assert_grep 'optional policy "Lint" is rejected' "$case_dir/stderr" \
+    "azure-red: a rejected optional policy was not reported"
+  assert_no_grep 'Docs' "$case_dir/stderr" \
+    "azure-red: a pending optional policy was reported as a blocker"
+  assert_absent "$case_dir/invoke-body.json" "azure-red: a red pull request was completed"
+  pass "a rejected Azure DevOps policy, required or optional, refuses the merge"
+}
+
+test_azure_devops_each_condition_refuses() {
+  local case_dir spec expected n=0
+  while IFS='|' read -r spec expected; do
+    [ -n "$spec" ] || continue
+    n=$((n + 1))
+    case_dir=$(make_azure_case "azure-cond-$n" "$spec")
+    azure_merge "$case_dir"
+    expect_code 1 "$AZURE_RC" "azure-cond: $spec should refuse"
+    assert_grep "$expected" "$case_dir/stderr" "azure-cond: $spec was not reported"
+    assert_absent "$case_dir/invoke-body.json" "azure-cond: $spec still completed"
+  done <<'EOF'
+merge=conflicts|mergeStatus is "conflicts": the source branch conflicts with the target branch
+draft=true|isDraft is "true", not false
+status=abandoned|status is "abandoned", not active
+merge=rejectedByPolicy|mergeStatus is "rejectedByPolicy", not succeeded
+reviewers=[{"displayName":"Ana","vote":-10}]|reviewer "Ana" rejected the pull request
+reviewers=[{"displayName":"Ben","vote":-5}]|reviewer "Ben" is waiting for the author
+repo=other|did not return pull request 7 of repository "api" in project "Xelta V2"
+EOF
+  case_dir=$(make_azure_case azure-cond-queued merge=queued)
+  azure_merge "$case_dir"
+  expect_code 1 "$AZURE_RC" "azure-cond: a still-computing mergeStatus should refuse after its bound"
+  assert_grep 'still being computed by Azure DevOps' "$case_dir/stderr" \
+    "azure-cond: a still-computing mergeStatus was not reported as pending"
+  [ "$(grep -c 'repos pr show' "$case_dir/az.log")" -eq 5 ] \
+    || fail "azure-cond: a still-computing mergeStatus was not re-read within its bound"
+  pass "a conflict, draft, closed state, negative vote, other repository, or pending mergeStatus refuses the merge"
+}
+
+test_azure_devops_completion_not_proven_refuses() {
+  local case_dir
+  case_dir=$(make_azure_case azure-unproven)
+  : > "$case_dir/stays-active"
+  azure_merge "$case_dir"
+  expect_code 1 "$AZURE_RC" "azure-unproven: an unproven completion should refuse"
+  assert_grep "has not reported it completed (status=active, mergeStatus=succeeded); nothing is recorded as landed and the merge poll remains armed" \
+    "$case_dir/stderr" "azure-unproven: the unproven completion was not reported"
+  [ "$(grep -c 'repos pr show' "$case_dir/az.log")" -eq 11 ] \
+    || fail "azure-unproven: the completed state was not re-read within its bound"
+  [ ! -e "$case_dir/state/task-x1.pr-poll-merge-notified" ] \
+    || fail "azure-unproven: an unproven completion was recorded as landed"
+  [ -f "$case_dir/state/task-x1.check.sh" ] \
+    || fail "azure-unproven: the merge poll was not left armed"
+
+  case_dir=$(make_azure_case azure-invoke-fails)
+  : > "$case_dir/invoke-fails"
+  azure_merge "$case_dir"
+  expect_code 1 "$AZURE_RC" "azure-invoke-fails: a refused completion should fail"
+  assert_grep 'Azure DevOps refused to complete' "$case_dir/stderr" \
+    "azure-invoke-fails: the refused completion was not reported"
+  [ ! -e "$case_dir/state/task-x1.pr-poll-merge-notified" ] \
+    || fail "azure-invoke-fails: a refused completion was recorded as landed"
+  pass "an Azure DevOps completion that is refused or never reads completed records nothing as landed"
+}
+
+test_azure_devops_missing_prerequisites_refuse_before_recording() {
+  local case_dir rc tool named
+  for tool in az jq; do
+    if [ "$tool" = az ]; then named='az (the Azure CLI)'; else named=jq; fi
+    case_dir=$(make_azure_case "azure-no-$tool")
+    mirror_path_without "$case_dir/no$tool" "$tool" "$case_dir/fakebin"
+    set +e
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" FM_TEST_AZ_DIR="$case_dir" \
+      PATH="$case_dir/no$tool" "$PR_MERGE" task-x1 "$AZ_URL" > "$case_dir/stdout" 2> "$case_dir/stderr"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "azure-no-$tool: fm-pr-merge should refuse"
+    assert_grep "error: merging an Azure DevOps pull request requires $named on PATH" "$case_dir/stderr" \
+      "azure-no-$tool: the refusal did not name the missing tool"
+    assert_no_grep "pr=$AZ_URL" "$case_dir/state/task-x1.meta" \
+      "azure-no-$tool: a PR reference was recorded despite the missing tool"
+  done
+  case_dir=$(make_azure_case azure-no-extension)
+  : > "$case_dir/no-extension"
+  azure_merge "$case_dir"
+  expect_code 1 "$AZURE_RC" "azure-no-extension: fm-pr-merge should refuse"
+  assert_grep 'requires the azure-devops extension for az' "$case_dir/stderr" \
+    "azure-no-extension: the refusal did not name the missing extension"
+  assert_no_grep "pr=$AZ_URL" "$case_dir/state/task-x1.meta" \
+    "azure-no-extension: a PR reference was recorded despite the missing extension"
+
+  case_dir=$(make_azure_case azure-auth-fails)
+  : > "$case_dir/auth-fails"
+  azure_merge "$case_dir"
+  expect_code 1 "$AZURE_RC" "azure-auth-fails: fm-pr-merge should refuse"
+  assert_grep "Azure DevOps authentication failed for $AZ_ORG_URL: sign in with az login, or set AZURE_DEVOPS_EXT_PAT" \
+    "$case_dir/stderr" "azure-auth-fails: the refusal did not name the missing sign-in"
+  assert_absent "$case_dir/invoke-body.json" "azure-auth-fails: an unauthenticated run still completed"
+  pass "a missing az, azure-devops extension, jq, or sign-in stops an Azure DevOps merge with a concrete reason"
+}
+
+test_azure_devops_green_pr_completes_with_the_verified_head
+test_azure_devops_merge_strategy_flags
+test_azure_devops_pending_required_policy_refuses
+test_azure_devops_failed_policy_refuses
+test_azure_devops_each_condition_refuses
+test_azure_devops_completion_not_proven_refuses
+test_azure_devops_missing_prerequisites_refuse_before_recording

@@ -47,11 +47,15 @@
 # appends " forge=gerrit shape=squash" to that line. The "Ship branch: <branch>"
 # line under it is machine-readable the same way: bin/fm-spawn.sh refuses a ship
 # whose spawn-selected branch disagrees with it.
-# forge is none|gerrit and defaults to none; bin/fm-project-mode.sh's header owns
-# what the registry binding means, and this file owns what gerrit changes for a
-# WORKER (docs/gerrit-forge-integration.md is the design). A forge composes with
-# the two modes that publish and is refused on local-only, which publishes
-# nothing. On gerrit the worker publishes one squashed change with
+# forge is none|gerrit|azure-devops and defaults to none; bin/fm-project-mode.sh's
+# header owns what the registry binding means, and this file owns what gerrit
+# and azure-devops change for a WORKER (docs/gerrit-forge-integration.md is the
+# Gerrit design). A forge composes with the two modes that publish and is
+# refused on local-only, which publishes nothing. On azure-devops only direct-PR
+# composes: the worker opens the pull request with plain `az repos pr create`
+# and reports its web URL, and no-mistakes is refused because the pipeline
+# cannot open or watch an Azure DevOps pull request. That block appends
+# " forge=azure-devops" to the delivery contract line. On gerrit the worker publishes one squashed change with
 # `gerrit-axi publish --squash` instead of opening a pull request: direct-PR does
 # that straight away, and no-mistakes first runs the pipeline with its three
 # forge-facing steps skipped and recovers the pipeline's own fix commits into its
@@ -139,13 +143,17 @@ EOF
 fm_forge_valid_for_mode() {  # <forge> <mode> <caller>
   local forge=$1 mode=$2 caller=$3
   case "$forge" in
-    none|gerrit) ;;
+    none|gerrit|azure-devops) ;;
     *)
-      echo "error: $caller: unknown forge '$forge' (expected none or gerrit)" >&2
+      echo "error: $caller: unknown forge '$forge' (expected none, gerrit, or azure-devops)" >&2
       return 1 ;;
   esac
   if [ "$forge" != none ] && [ "$mode" = local-only ]; then
     echo "error: $caller: forge=$forge cannot ship mode=local-only - that mode publishes nothing, so a forge has no meaning there, and its landing would fast-forward local main with content the review server has never seen; ship no-mistakes or direct-PR, which publish through the forge" >&2
+    return 1
+  fi
+  if [ "$forge" = azure-devops ] && [ "$mode" != direct-PR ]; then
+    echo "error: $caller: forge=azure-devops ships only mode=direct-PR - the no-mistakes pipeline cannot open or watch an Azure DevOps pull request, so the worker opens it with az repos pr create" >&2
     return 1
   fi
   return 0
@@ -158,7 +166,8 @@ fm_forge_valid_for_mode() {  # <forge> <mode> <caller>
 # lines (fm_brief_base_branches) disagree, and records base_branch= in the task
 # metadata, and every later consumer reads that metadata field. It is
 # refused on local-only, whose landing fast-forwards local main, and on a Gerrit
-# forge, whose publish path targets the change's own branch.
+# forge, whose publish path targets the change's own branch; an Azure DevOps
+# pull request targets it with az repos pr create --target-branch.
 fm_base_branch_valid() {  # <base> <mode> <forge> <caller>
   local base=$1 mode=$2 forge=$3 caller=$4
   [ -n "$base" ] || return 0
@@ -170,7 +179,7 @@ fm_base_branch_valid() {  # <base> <mode> <forge> <caller>
     echo "error: $caller: a base branch cannot ship mode=local-only, whose landing fast-forwards local main; ship no-mistakes or direct-PR, which open a pull request against the base" >&2
     return 1
   fi
-  if [ "$forge" != none ]; then
+  if [ "$forge" = gerrit ]; then
     echo "error: $caller: a base branch is not supported on forge=$forge" >&2
     return 1
   fi
@@ -458,6 +467,26 @@ The squashed change carries only the oldest commit's message, so the pipeline's 
 After publishing and immediately before your ready report, append one line \`note [at=<epoch>]: pipeline changes: {finding} - {fix it made}; {finding} - {fix it made}\` to the status file, one short clause per finding the run fixed, taken from the run's \`fixes\` table and the gate findings its drive calls returned (\`no-mistakes axi logs --step <step> --full\` has the detail); write \`note [at=<epoch>]: pipeline changes: none\` when it fixed nothing.
 EOF
       fm_gerrit_publish_block
+      ;;
+    direct-PR:azure-devops)
+      [ -z "$base" ] || pr_base=", against the base branch \`$base\` (\`--target-branch $base_q\`), not the repository default"
+      cat <<EOF
+# Definition of done
+Delivery contract: mode=direct-PR forge=azure-devops
+Ship branch: $branch
+This task ships **direct-PR** to Azure DevOps: you raise the pull request yourself with plain \`az repos pr create\`, without the no-mistakes pipeline.
+The task is complete only when committed on your branch.
+When it is implemented and committed, push your branch to \`origin\` and open a pull request that is ready for review, not a draft$pr_base: run \`az repos pr create --source-branch $branch --draft false --org <organization URL> --project <project> --repository <repository> --title <title> --description <description> --output json\`, taking the organization URL (\`https://dev.azure.com/<org>\`), project, and repository from your \`origin\` remote rather than from any \`az devops configure\` default.
+Authenticate only through the environment you run in (\`az login\`, or \`AZURE_DEVOPS_EXT_PAT\` set by the organization's \`.envrc\`); never print, store, or pass a credential on a command line.
+If \`az\`, its \`azure-devops\` extension, or a working sign-in is missing, append \`blocked [at=<epoch>]: {what is missing}\` and stop.
+Before you report done, read the pull request back with \`az repos pr show --id <id> --org <organization URL> --output json\` and confirm \`isDraft\` is \`false\` and \`status\` is \`active\`; if it is a draft, publish it with \`az repos pr update --id <id> --draft false --org <organization URL>\`.
+A draft cannot be merged, so a done report on one leaves the merge unasked.
+Report the pull request's web URL: the \`repository.webUrl\` field of that output followed by \`/pullrequest/<id>\`, which reads \`https://dev.azure.com/<org>/<project>/_git/<repository>/pullrequest/<id>\`, never the API \`url\` field.
+Then append \`done [at=<epoch>]: PR {url}\` to the status file and stop.
+That \`done:\` is accepted only when this copy's HEAD - your latest commit - is pushed to your PR branch; the check tests that commit, not merely that a branch moved.
+If you deliberately keep the PR a draft, append \`paused [at=<epoch>]: {why the draft is held}\` instead of done.
+Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
+EOF
       ;;
     direct-PR:*)
       cat <<EOF

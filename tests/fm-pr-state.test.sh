@@ -264,9 +264,63 @@ test_refusals_exit_nonzero() {
   out=$(PATH="$FAKEBIN:$PATH" "$SCRIPT" 7 2>&1) || status=$?
   [ "$status" -ne 0 ] \
     || fail "a bare number resolves against the ambient repository and is not an address"
-  assert_contains "$out" 'expected a GitHub pull-request URL' \
+  assert_contains "$out" 'expected a GitHub or Azure DevOps pull-request URL' \
     "a bare number must be refused as an address, not attempted as a lookup"
   pass "argument and lookup refusals exit nonzero"
+}
+
+AZ_STATE_URL='https://dev.azure.com/match-best/Xelta%20V2/_git/api/pullrequest/7'
+fm_fake_az "$FAKEBIN"
+
+az_state_case() {  # <name>; echoes a fresh az fixture directory
+  local dir="$TMP_ROOT/az-$1"
+  mkdir -p "$dir"
+  : > "$dir/az.log"
+  fm_fake_az_pr_json "$dir/pr.json"
+  printf '%s\n' "$dir"
+}
+
+test_azure_devops_clean_and_terminal_states() {
+  local dir out
+  dir=$(az_state_case clean)
+  printf '[%s,%s]\n' "$(fm_fake_az_policy Build approved)" "$(fm_fake_az_policy Docs running false)" \
+    > "$dir/policies.json"
+  out=$(FM_TEST_AZ_DIR="$dir" PATH="$FAKEBIN:$PATH" "$SCRIPT" "$AZ_STATE_URL") \
+    || fail "a clean Azure DevOps pull request was refused"
+  [ -z "$out" ] || fail "a clean Azure DevOps pull request printed blockers: $out"
+  grep -qxF 'repos pr policy list --id 7 --org https://dev.azure.com/match-best --only-show-errors --output json' "$dir/az.log" \
+    || fail "the policy evaluations were not read pinned to the URL's organization"
+
+  dir=$(az_state_case completed)
+  fm_fake_az_pr_json "$dir/pr.json" status=completed draft=true merge=conflicts
+  out=$(FM_TEST_AZ_DIR="$dir" PATH="$FAKEBIN:$PATH" "$SCRIPT" "$AZ_STATE_URL") \
+    || fail "a completed Azure DevOps pull request was refused"
+  assert_equals 'STATE: merged at 2026-10-12T10:00:00Z' "$out" "a completed pull request reported more than its state"
+  pass "a clean Azure DevOps pull request is silent and a completed one reports only that"
+}
+
+test_azure_devops_blockers_are_reported() {
+  local dir out
+  dir=$(az_state_case blockers)
+  fm_fake_az_pr_json "$dir/pr.json" draft=true merge=conflicts \
+    'reviewers=[{"displayName":"Ana","vote":-10},{"displayName":"Ben","vote":10}]'
+  printf '[%s,%s,%s]\n' "$(fm_fake_az_policy Build queued)" \
+    "$(fm_fake_az_policy Lint rejected false)" "$(fm_fake_az_policy Tests approved)" > "$dir/policies.json"
+  out=$(FM_TEST_AZ_DIR="$dir" PATH="$FAKEBIN:$PATH" "$SCRIPT" "$AZ_STATE_URL") \
+    || fail "an Azure DevOps pull request with blockers was refused"
+  assert_equals 'DRAFT: pull request is not ready for review
+MERGEABILITY: conflicting
+REQUIRED CHECK: Build (queued)
+OPTIONAL CHECK: Lint (rejected)
+REVIEW: Ana REJECTED' "$out" "the Azure DevOps blockers were not reported one per line"
+
+  dir=$(az_state_case auth)
+  : > "$dir/auth-fails"
+  out=$(FM_TEST_AZ_DIR="$dir" PATH="$FAKEBIN:$PATH" "$SCRIPT" "$AZ_STATE_URL" 2>&1) \
+    && fail "an unauthenticated Azure DevOps read exited zero"
+  assert_contains "$out" 'Azure DevOps authentication failed for https://dev.azure.com/match-best: sign in with az login, or set AZURE_DEVOPS_EXT_PAT' \
+    "the refusal did not name the missing sign-in"
+  pass "Azure DevOps draft, conflict, policy, and review blockers are reported, and a failed sign-in is named"
 }
 
 test_clean_pr_is_silent_and_ignores_skipped_checks
@@ -284,3 +338,5 @@ test_no_reported_checks_is_unverified
 test_help_states_what_silence_means_and_what_is_out_of_scope
 test_unknown_mergeability_is_a_blocker
 test_refusals_exit_nonzero
+test_azure_devops_clean_and_terminal_states
+test_azure_devops_blockers_are_reported

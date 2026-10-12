@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Report the blockers this command can see on one GitHub pull request.
+# Report the blockers this command can see on one GitHub or Azure DevOps pull
+# request.
 #
 # This is a one-shot, read-only command. It reads the current pull request,
 # reported checks, submitted reviews, and review decision from GitHub at
@@ -17,6 +18,16 @@
 # STALE when it was left at a superseded head.
 # A closed or merged pull request reports that terminal state and nothing else.
 # Unresolved review-thread state is out of this command's scope.
+#
+# An Azure DevOps pull request is read through plain az with its azure-devops
+# extension, pinned to the URL's organization, with the environment's own
+# sign-in. Its policy evaluations list every policy that applies, including a
+# required one that has not reported yet, so each required policy that is not
+# green is printed as a REQUIRED CHECK line with its status and a rejected
+# optional one as an OPTIONAL CHECK line, by the rule fm_pr_azure_policy_blockers
+# in bin/fm-pr-lib.sh owns. A reviewer vote that rejects or waits for the author
+# is printed as a REVIEW line. A missing az, extension, or jq, and a failed
+# sign-in, refuse with a sentence naming what is missing.
 #
 # Usage: fm-pr-state.sh <pr-url>
 #   Prints one line per blocker it can see and nothing when it sees none.
@@ -43,12 +54,80 @@ if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
   exit 0
 fi
 [ "$#" -eq 1 ] || die "usage: fm-pr-state.sh <pr-url>"
-command -v gh >/dev/null 2>&1 || die "gh is required"
 
 URL=$1
-if ! fm_pr_url_parse "$URL" || [ "$FM_PR_PROVIDER" != github ]; then
-  die "expected a GitHub pull-request URL"
+if ! fm_pr_url_parse "$URL" \
+  || { [ "$FM_PR_PROVIDER" != github ] && [ "$FM_PR_PROVIDER" != azure-devops ]; }; then
+  die "expected a GitHub or Azure DevOps pull-request URL"
 fi
+
+azure_state() {
+  local missing fields line state='' closed='' draft='' merge_status='' blockers kind name status
+  missing=$(fm_pr_azure_missing) || die "reading an Azure DevOps pull request requires $missing on PATH"
+  fm_pr_azure_read_pr "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" \
+    || die "could not read $URL: $FM_PR_AZURE_ERROR"
+  fields=$(printf '%s' "$FM_PR_AZURE_PR_JSON" | jq -r '
+    "state=" + ((.status // "") | tostring),
+    "closed=" + ((.closedDate // "") | tostring),
+    "draft=" + (.isDraft | tostring),
+    "merge_status=" + ((.mergeStatus // "") | tostring)') \
+    || die "Azure DevOps returned incomplete pull-request state for $URL"
+  while IFS= read -r line; do
+    case "$line" in
+      state=*) state=${line#state=} ;;
+      closed=*) closed=${line#closed=} ;;
+      draft=*) draft=${line#draft=} ;;
+      merge_status=*) merge_status=${line#merge_status=} ;;
+    esac
+  done <<EOF_AZURE
+$fields
+EOF_AZURE
+  case "$state" in
+    completed) printf 'STATE: merged at %s\n' "${closed:-unknown time}"; return 0 ;;
+    active) ;;
+    '') die "Azure DevOps returned incomplete pull-request state for $URL" ;;
+    *) printf 'STATE: %s\n' "$state"; return 0 ;;
+  esac
+  case "$draft" in
+    false) ;;
+    true) printf 'DRAFT: pull request is not ready for review\n' ;;
+    *) die "Azure DevOps returned incomplete pull-request state for $URL" ;;
+  esac
+  case "$merge_status" in
+    succeeded) ;;
+    conflicts) printf 'MERGEABILITY: conflicting\n' ;;
+    queued|notSet|'') printf 'MERGEABILITY: unknown\n' ;;
+    *) printf 'MERGEABILITY: %s\n' "$merge_status" ;;
+  esac
+  fm_pr_azure_run "$FM_PR_AZURE_ORG_URL" repos pr policy list --id "$FM_PR_NUMBER" \
+    || die "could not read policy evaluations for $URL: $FM_PR_AZURE_ERROR"
+  blockers=$(fm_pr_azure_policy_blockers "$FM_PR_AZURE_OUT") \
+    || die "could not read policy evaluations for $URL"
+  while IFS="$(printf '\t')" read -r kind name status; do
+    case "$kind" in
+      red|pending) printf 'REQUIRED CHECK: %s (%s)\n' "$name" "$status" ;;
+      red-optional) printf 'OPTIONAL CHECK: %s (%s)\n' "$name" "$status" ;;
+    esac
+  done <<EOF_POLICIES
+$blockers
+EOF_POLICIES
+  blockers=$(fm_pr_azure_review_blockers "$FM_PR_AZURE_PR_JSON") \
+    || die "could not read reviewer votes for $URL"
+  while IFS="$(printf '\t')" read -r kind name; do
+    case "$kind" in
+      rejected) printf 'REVIEW: %s REJECTED\n' "$name" ;;
+      waiting) printf 'REVIEW: %s WAITING FOR AUTHOR\n' "$name" ;;
+    esac
+  done <<EOF_REVIEWS
+$blockers
+EOF_REVIEWS
+}
+
+if [ "$FM_PR_PROVIDER" = azure-devops ]; then
+  azure_state
+  exit 0
+fi
+command -v gh >/dev/null 2>&1 || die "gh is required"
 
 PATH_PART=$FM_PR_PATH
 NUMBER=$FM_PR_NUMBER

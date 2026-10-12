@@ -7,7 +7,7 @@
 # is absent, so every existing installation keeps its current "fm/<task-id>"
 # branch names unchanged.
 # With --forge it prints one word instead: the project's registered forge,
-# none|gerrit. The forge is asked for explicitly, so the default output stays
+# none|gerrit|azure-devops. The forge is asked for explicitly, so the default output stays
 # the same two words for every project, bound or not.
 #
 # MECHANICAL CONSUMERS ONLY. This answers "what posture did the captain register
@@ -28,6 +28,7 @@
 #   - <name> [<mode> +yolo] - <desc> (added <date>)                  -> <mode> on fm/
 #   - <name> [<mode> +yolo branch=<prefix>] - <desc> (added <date>)  -> <mode> <yolo> <prefix>
 #   - <name> [<mode> forge=gerrit] - <desc> (added <date>)           -> <mode> off, --forge gerrit
+#   - <name> [direct-PR forge=azure-devops] - <desc> (added <date>)  -> direct-PR <yolo>, --forge azure-devops
 #   <name> may contain spaces; it ends at the literal " [" or " - " that follows it.
 #   Bracket tokens are order-independent: +yolo, branch=<prefix>, and forge=<value>
 #   are recognized by their own shape wherever they appear, and whichever token is
@@ -57,7 +58,9 @@
 #   `none` means a forge whose pull requests and checks no-mistakes already
 #   drives, and `gerrit` means a Gerrit server: no pull requests, so the worker
 #   publishes a change with gerrit-axi instead (bin/fm-dod-lib.sh owns what that
-#   changes for a worker in each publishing mode).
+#   changes for a worker in each publishing mode), and `azure-devops` means an
+#   Azure DevOps repository, whose pull requests the worker opens with plain
+#   `az repos pr create` and firstmate watches and merges through az.
 #   The binding is EXPLICIT because a provider family must never be guessed;
 #   bin/fm-forge-detect.sh proposes it from a protocol fact at project-add
 #   intake, and the captain's confirmation is what this record holds.
@@ -66,6 +69,9 @@
 #   lands by fast-forwarding local main, which on a review-server project
 #   advances it with content the server has never seen
 #   (docs/gerrit-forge-integration.md section 3).
+#   `azure-devops` composes with direct-PR alone, so a registered no-mistakes,
+#   no-mistakes-prod-only, or local-only posture with it is refused: the
+#   no-mistakes pipeline cannot open or watch an Azure DevOps pull request.
 #
 # A registered `forge=gerrit` project reports yolo=off with an explicit stderr
 # refusal, on the captain's decision of 2026-09-15: a Gerrit Code-Review+2 is a
@@ -83,7 +89,7 @@
 # `branch` resolves as it did before the forge existed, and in the mode slot it
 # is read as an unknown mode. A key one or two edits from `forge` (such as
 # `forg=` or `Forge=`) is still ignored, with one stderr warning naming the token
-# and the forge=gerrit spelling. The one refusal is a malformed forge binding - a
+# and the forge=gerrit and forge=azure-devops spellings. The one refusal is a malformed forge binding - a
 # `forge=` token whose value is empty or outside the closed set - which is
 # REFUSED in the default and --forge output forms: nothing on stdout, exit
 # status 3, the token named. Resolving it to "no registered forge" would hand a
@@ -192,7 +198,7 @@ fi
 posture=
 while IFS=' ' read -r kind rest; do
   case "$kind" in
-    near) echo "warn: ignoring \"$rest\" registered for $NAME in $REG; it is not a forge binding, and the forge binding is spelled forge=gerrit" >&2 ;;
+    near) echo "warn: ignoring \"$rest\" registered for $NAME in $REG; it is not a forge binding, and the forge binding is spelled forge=gerrit or forge=azure-devops" >&2 ;;
     posture) posture=$rest ;;
   esac
 done <<EOF
@@ -215,16 +221,20 @@ if [ "$BRANCH_PREFIX_QUERY" -eq 1 ]; then
 fi
 
 case "$forge" in
-  none|forge=gerrit) forge=${forge#forge=} ;;
+  none|forge=gerrit|forge=azure-devops) forge=${forge#forge=} ;;
   forge=)
-    echo "refused: empty forge binding \"forge=\" registered for $NAME in $REG; the accepted value is forge=gerrit, or no forge token at all for a forge whose pull requests no-mistakes already drives; correct the registry entry" >&2
+    echo "refused: empty forge binding \"forge=\" registered for $NAME in $REG; the accepted values are forge=gerrit and forge=azure-devops, or no forge token at all for a forge whose pull requests no-mistakes already drives; correct the registry entry" >&2
     exit 3 ;;
   *)
-    echo "refused: unknown forge \"${forge#forge=}\" registered for $NAME in $REG; the accepted value is forge=gerrit, or no forge token at all for a forge whose pull requests no-mistakes already drives; correct the registry entry" >&2
+    echo "refused: unknown forge \"${forge#forge=}\" registered for $NAME in $REG; the accepted values are forge=gerrit and forge=azure-devops, or no forge token at all for a forge whose pull requests no-mistakes already drives; correct the registry entry" >&2
     exit 3 ;;
 esac
 if [ "$forge" != none ] && [ "$mode" = local-only ]; then
   echo "refused: $NAME is registered local-only with forge=$forge in $REG; local-only publishes nothing, so a forge has no meaning there, and its landing would fast-forward local main with content the review server has never seen; register no-mistakes or direct-PR to publish through the forge, or drop the forge token to keep the project local" >&2
+  exit 3
+fi
+if [ "$forge" = azure-devops ] && [ "$mode" != direct-PR ]; then
+  echo "refused: $NAME is registered $mode with forge=azure-devops in $REG; Azure DevOps ships only direct-PR, because the no-mistakes pipeline cannot open or watch an Azure DevOps pull request; register direct-PR, or drop the forge token" >&2
   exit 3
 fi
 if [ "$WANT_FORGE" -eq 1 ]; then
