@@ -2,9 +2,9 @@
 # tests/fm-secondmate-linked-projects.test.sh - linked projects for local
 # secondmate homes: seeding a projects/<project> link to a repository in the
 # <link-root>/<project-dir>/code/<repo> workspace layout (new clone and adopt),
-# every containment refusal, rollback and retirement removing only the linked
-# code/<repo> directory, symlink retargeting between seed and cleanup, the
-# landed-work gate on retirement, consumers that work through the link, and
+# every containment refusal, rollback removing only a cloned code/<repo>
+# directory, symlink retargeting between seed and rollback, retirement leaving
+# every linked repository in place, consumers that work through the link, and
 # unchanged behavior for a home with no link root.
 set -u
 
@@ -314,83 +314,53 @@ seed_retirable() {  # -> SUB, TARGET, ADOPTED
   register_meta design "$SUB"
 }
 
-assert_retirement_refused_unchanged() {  # <context>
-  assert_present "$SUB/.fm-secondmate-home" "$1 removed the secondmate home"
-  assert_present "$MAIN/state/design.meta" "$1 removed the parent metadata"
-  assert_grep '- design ' "$MAIN/data/secondmates.md" "$1 removed the registry route"
-  assert_present "$TARGET/.git" "$1 removed the linked repository"
+# The clean, fully pushed $TARGET holds gitignored local files that no git
+# check can see; retirement must leave them and every other linked repository.
+add_gitignored_files() {
+  printf '.env\ndata/\n' >> "$TARGET/.git/info/exclude"
+  printf 'SECRET=1\n' > "$TARGET/.env"
+  mkdir -p "$TARGET/data"
+  printf 'local\n' > "$TARGET/data/local.db"
+  [ -z "$(git -C "$TARGET" status --porcelain --untracked-files=all)" ] || fail "the gitignored fixture made $TARGET dirty"
+}
+
+assert_retired_keeping_linked_repos() {  # <context>
+  assert_absent "$SUB" "$1 left the secondmate home"
+  assert_no_grep '- design ' "$MAIN/data/secondmates.md" "$1 left the registry route"
+  assert_present "$TARGET/.git" "$1 removed the clean, fully pushed linked repository"
+  assert_present "$TARGET/.env" "$1 removed a gitignored file in a linked repository"
+  assert_present "$TARGET/data/local.db" "$1 removed gitignored data in a linked repository"
   assert_present "$ADOPTED/.git" "$1 removed the adopted linked repository"
-  [ -L "$SUB/projects/alpha" ] || fail "$1 removed the projects/alpha link"
-  [ ! -s "$LOG" ] || fail "$1 acted on the secondmate endpoint: $(cat "$LOG")"
+  assert_org_project_intact alpha-proj "$1"
+  assert_org_project_intact beta-proj "$1"
+  assert_present "$MAIN/projects/alpha/.git" "$1 disturbed the main home's project"
 }
 
-test_retirement_removes_only_landed_linked_repos() {
+test_retirement_keeps_every_linked_repo() {
   local out
-  seed_retirable retire-clean
-  : > "$LOG"
+  seed_retirable retire-keep
+  add_gitignored_files
+  printf 'wip\n' > "$ADOPTED/wip.txt"
+  ln -sfn "$ORG/alpha-proj/code/sibling" "$SUB/projects/alpha"
   out=$(retire design 2>&1) || fail "retirement of a linked home failed: $out"
-  assert_absent "$SUB" "retirement left the secondmate home"
-  assert_absent "$TARGET" "retirement left the landed linked repository"
-  assert_absent "$ADOPTED" "retirement left the landed adopted linked repository"
-  assert_no_grep '- design ' "$MAIN/data/secondmates.md" "retirement left the registry route"
-  assert_org_project_intact alpha-proj "retirement"
-  assert_org_project_intact beta-proj "retirement"
-  assert_present "$MAIN/projects/alpha/.git" "retirement disturbed the main home's project"
-  pass "retirement removes only each landed linked code/<repo>; code/, README.md, docs/, data/, and siblings survive"
+  assert_retired_keeping_linked_repos "retirement"
+  assert_present "$ADOPTED/wip.txt" "retirement removed uncommitted work in a linked repository"
+  pass "retirement removes only the home and its links; clean, dirty, and retargeted linked repositories survive"
 }
 
-test_retirement_refuses_unlanded_or_retargeted_links() {
-  local out rc
-  seed_retirable retire-dirty
-  printf 'wip\n' > "$TARGET/wip.txt"
-  : > "$LOG"
-  rc=0; out=$(retire design 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "retirement accepted a linked repository with uncommitted changes"
-  assert_contains "$out" "uncommitted changes" "dirty refusal did not name the uncommitted changes: $out"
-  assert_retirement_refused_unchanged "the dirty-linked-repo refusal"
-  rm -f "$TARGET/wip.txt"
-
-  printf 'more\n' >> "$TARGET/README.md"
-  git -C "$TARGET" commit -qam 'local only'
-  rc=0; out=$(retire design 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "retirement accepted a linked repository with unpushed commits"
-  assert_contains "$out" "commits not on any remote" "unpushed refusal did not name the commits: $out"
-  assert_retirement_refused_unchanged "the unpushed-linked-repo refusal"
-  git -C "$TARGET" reset -q --hard origin/main
-
-  ln -sfn "$ORG/alpha-proj/code/sibling" "$SUB/projects/alpha"
-  rc=0; out=$(retire design 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "retirement followed a retargeted link"
-  assert_contains "$out" "not its recorded" "retarget refusal did not name the recorded target: $out"
-  assert_present "$ORG/alpha-proj/code/sibling/.git" "retarget refusal removed the new link target"
-  ln -sfn "$TARGET" "$SUB/projects/alpha"
-  assert_retirement_refused_unchanged "the retargeted-link refusal"
-
+test_forced_retirement_keeps_every_linked_repo() {
+  local out
+  seed_retirable retire-force
+  add_gitignored_files
+  printf 'more\n' >> "$ADOPTED/README.md"
+  git -C "$ADOPTED" commit -qam 'local only'
   cp "$SUB/config/linked-projects" "$W/good-manifest"
   sed "s|^link.alpha=.*|link.alpha=$(cd "$ORG" && pwd -P)/alpha-proj/code/sibling|" "$W/good-manifest" > "$SUB/config/linked-projects"
   ln -sfn "$ORG/alpha-proj/code/sibling" "$SUB/projects/alpha"
-  git -C "$ORG/alpha-proj/code/sibling" remote add origin "file://$W/nowhere.git"
-  rc=0; out=$(retire design 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "retirement removed an unpushed repository recorded through an edited manifest"
-  assert_present "$ORG/alpha-proj/code/sibling/.git" "edited-manifest refusal removed the sibling repo"
-  cp "$W/good-manifest" "$SUB/config/linked-projects"
-  ln -sfn "$TARGET" "$SUB/projects/alpha"
-  assert_retirement_refused_unchanged "the edited-manifest refusal"
-  pass "retirement refuses without changes on uncommitted, unpushed, or retargeted linked repositories"
-}
-
-test_forced_retirement_keeps_unlanded_linked_repo() {
-  local out
-  seed_retirable retire-force
-  printf 'wip\n' > "$TARGET/wip.txt"
   out=$(retire design --force 2>&1) || fail "forced retirement failed: $out"
-  assert_absent "$SUB" "forced retirement left the secondmate home"
-  assert_present "$TARGET/wip.txt" "forced retirement discarded unlanded work in a linked repository"
-  assert_contains "$out" "keeps that linked repository in place" "forced retirement did not explain the kept repository: $out"
-  assert_absent "$ADOPTED" "forced retirement left a landed linked repository"
-  assert_org_project_intact alpha-proj "forced retirement"
-  assert_org_project_intact beta-proj "forced retirement"
-  pass "forced retirement keeps an unlanded linked repository and removes landed ones"
+  assert_retired_keeping_linked_repos "forced retirement"
+  [ -n "$(git -C "$ADOPTED" log --oneline HEAD --not --remotes)" ] || fail "forced retirement lost an unpushed commit in a linked repository"
+  pass "forced retirement removes only the home and its links; every linked repository survives"
 }
 
 test_home_without_link_root_is_unchanged() {
@@ -420,7 +390,6 @@ test_seed_adopts_existing_target_only_with_matching_origin
 test_seed_refuses_every_containment_violation
 test_rollback_removes_only_the_cloned_code_repo
 test_rollback_refuses_a_retargeted_link
-test_retirement_removes_only_landed_linked_repos
-test_retirement_refuses_unlanded_or_retargeted_links
-test_forced_retirement_keeps_unlanded_linked_repo
+test_retirement_keeps_every_linked_repo
+test_forced_retirement_keeps_every_linked_repo
 test_home_without_link_root_is_unchanged
