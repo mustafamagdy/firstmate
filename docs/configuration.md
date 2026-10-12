@@ -749,11 +749,11 @@ A home without that manifest has no link root and behaves exactly as before, and
 A missing target is cloned, but only into an existing `code/` folder: seeding never creates the project root, `code/`, `docs/`, or `data/`.
 An existing target is adopted only when its origin matches, and project registry entries, delivery modes, and no-mistakes initialization follow the same rules as cloned projects.
 
-Containment is enforced in code at seed time, at rollback, and at retirement.
+Containment is enforced in code at seed time and at rollback.
 A target must resolve to exactly that layout inside the link root, and must not equal, contain, or sit inside the firstmate code root, the main or active home, the secondmate home, any other local secondmate home reachable through the registries, or any other home's linked target.
-Cleanup removes only the resolved `code/<repo>` directory and the `projects/<project>` link, never `code/` itself, the project root, `README.md`, `docs/`, `data/`, or sibling repositories.
-Seed rollback removes a target only when that seed cloned it, and only the link for an adopted one.
-Retirement refuses without changes while a recorded link points somewhere other than its recorded target or a linked repository holds uncommitted, stashed, or unpushed work; `--force` keeps such a repository in place instead.
+Seed rollback removes a target only when that seed cloned it, and only the link for an adopted one; it never removes `code/` itself, the project root, `README.md`, `docs/`, `data/`, or sibling repositories.
+Retirement, forced or not, never removes a linked repository, whether seed adopted or cloned it, because linked repositories are often working copies holding gitignored files no landed-work check can see.
+It removes only the home and its `projects/<project>` links, and refuses without changes while a recorded linked path is no longer a link.
 [`bin/fm-linked-projects-lib.sh`](../bin/fm-linked-projects-lib.sh) owns the manifest format and the exact checks.
 Remote secondmate homes and the main home's own `projects/` do not use linked projects.
 

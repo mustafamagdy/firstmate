@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034 # parsed fields are output globals for sourcing callers.
 # Linked projects for local secondmate homes: the manifest parser and the
-# containment and landed-work checks that every seed, rollback, and retirement
-# step reruns before it touches a linked repository.
+# containment checks that every seed and rollback step reruns before it touches
+# a linked repository. Retirement never removes a linked repository.
 #
 # A local secondmate home may keep a project repository outside the home, in the
 # standard workspace layout <link-root>/<project-dir>/code/<repo>, reached through
@@ -24,9 +24,9 @@
 # (the active home, its local parent chain up to the main home, every local home
 # registered under any of them, and the secondmate home itself), any other home's
 # linked project target, or another project's target in the same home.
-# Cleanup removes only that resolved code/<repo> directory and the
-# projects/<project> link; it never removes code/ itself, the project root,
-# README.md, docs/, data/, or sibling repositories.
+# Seed rollback removes only a resolved code/<repo> directory that seed itself
+# cloned, plus the projects/<project> link; it never removes code/ itself, the
+# project root, README.md, docs/, data/, or sibling repositories.
 #
 # Callers source bin/fm-secondmate-registry-lib.sh and
 # bin/fm-secondmate-parent-lib.sh first; this file reads registries and parent
@@ -396,43 +396,4 @@ $FM_LP_ENTRIES
 EOF
   fi
   printf '%s\n' "$target"
-}
-
-# Print why <repo> holds work that has not landed, or nothing when it is clean
-# and every local commit is on a remote. Returns 0 when landed.
-fm_lp_unlanded_reason() {
-  local repo=$1 top out
-  top=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || {
-    printf 'cannot inspect %s as a git repository\n' "$repo"
-    return 1
-  }
-  if ! [ "$top" -ef "$repo" ]; then
-    printf '%s is not the root of its own repository\n' "$repo"
-    return 1
-  fi
-  out=$(git -C "$repo" status --porcelain --untracked-files=all 2>/dev/null) || {
-    printf 'cannot inspect %s for uncommitted changes\n' "$repo"
-    return 1
-  }
-  if [ -n "$out" ]; then
-    printf '%s has uncommitted changes\n' "$repo"
-    return 1
-  fi
-  out=$(git -C "$repo" log --oneline HEAD --branches --not --remotes -- 2>/dev/null) || {
-    printf 'cannot inspect %s for unpushed commits\n' "$repo"
-    return 1
-  }
-  if [ -n "$out" ]; then
-    printf '%s has commits not on any remote\n' "$repo"
-    return 1
-  fi
-  out=$(git -C "$repo" stash list 2>/dev/null) || {
-    printf 'cannot inspect %s for stashed changes\n' "$repo"
-    return 1
-  }
-  if [ -n "$out" ]; then
-    printf '%s has stashed changes\n' "$repo"
-    return 1
-  fi
-  return 0
 }
