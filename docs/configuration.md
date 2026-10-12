@@ -12,7 +12,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | Worker permissions, accounts, or environment | [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), and [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist) |
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
-| Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
+| Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) and [linked projects](#linked-projects-configlinked-projects) |
 | Per-run overrides and tuning | [Environment variables](#environment-variables) |
 
 ## FM_HOME
@@ -94,7 +94,7 @@ Each effective `FM_HOME` contains private operational directories.
 
 `config/` holds local gitignored operating choices, including explicit extension bindings under `config/extensions.d/`.
 
-`projects/` holds local project clones.
+`projects/` holds local project clones, or, in a local secondmate home, links to linked project repositories (see [Linked projects](#linked-projects-configlinked-projects)).
 Firstmate reads these clones, but changes them only through the narrow guarded and concrete captain-approved exceptions in `AGENTS.md`.
 Untracked files and directories whose names begin with `scratchpad` are also gitignored, so temporary scratch does not make porcelain-based secondmate sync guards treat a home as dirty.
 
@@ -738,6 +738,24 @@ After creating a secondmate, move existing main-backlog queued items that you ha
 Set `FM_SECONDMATE_CHARTER` to seed from inline charter text when no filled charter brief exists; set `FM_SECONDMATE_SCOPE` when the routing scope should differ from the charter text.
 
 The seeded home's `data/charter.md` owns the standard secondmate lifecycle and escalation contract; the route file points to it through the existing `home:` field instead of adding another pointer.
+
+### Linked projects (config/linked-projects)
+
+A local secondmate home may keep project repositories outside the home, in the standard workspace layout `<link-root>/<project-dir>/code/<repo>`, reached through links at `projects/<project>`.
+Seed one with `fm-home-seed.sh <id> <home|-> --link-root <org-dir> <project>=<absolute repo path>...`; linked and ordinary cloned projects may be mixed in one seed.
+The home records its one link root and every linked target in its gitignored `config/linked-projects` manifest, which is never inherited from the primary.
+A home without that manifest has no link root and behaves exactly as before, and a home that already declares a link root refuses a different one.
+
+A missing target is cloned, but only into an existing `code/` folder: seeding never creates the project root, `code/`, `docs/`, or `data/`.
+An existing target is adopted only when its origin matches, and project registry entries, delivery modes, and no-mistakes initialization follow the same rules as cloned projects.
+
+Containment is enforced in code at seed time, at rollback, and at retirement.
+A target must resolve to exactly that layout inside the link root, and must not equal, contain, or sit inside the firstmate code root, the main or active home, the secondmate home, any other local secondmate home reachable through the registries, or any other home's linked target.
+Cleanup removes only the resolved `code/<repo>` directory and the `projects/<project>` link, never `code/` itself, the project root, `README.md`, `docs/`, `data/`, or sibling repositories.
+Seed rollback removes a target only when that seed cloned it, and only the link for an adopted one.
+Retirement refuses without changes while a recorded link points somewhere other than its recorded target or a linked repository holds uncommitted, stashed, or unpushed work; `--force` keeps such a repository in place instead.
+[`bin/fm-linked-projects-lib.sh`](../bin/fm-linked-projects-lib.sh) owns the manifest format and the exact checks.
+Remote secondmate homes and the main home's own `projects/` do not use linked projects.
 
 ### Identity markers and upgrades
 

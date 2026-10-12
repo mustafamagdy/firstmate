@@ -197,6 +197,14 @@
 # leased home releases its durable treehouse lease so the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
+# A home's linked projects (bin/fm-linked-projects-lib.sh) live outside it:
+# before any change, retirement requires each recorded link to still point at
+# its recorded target and that target to pass every containment check, and a
+# non-forced retirement refuses without changes while a linked repository holds
+# uncommitted, stashed, or unpushed work. --force keeps such a repository in
+# place instead of discarding it. After the home is removed, only each landed
+# linked repository's resolved code/<repo> directory is removed, after the
+# same checks pass again.
 # Usage: fm-teardown.sh <task-id> [--force] [--legacy-record]
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
@@ -361,6 +369,7 @@ for _teardown_source in \
   fm-env-lib.sh \
   fm-secondmate-registry-lib.sh \
   fm-secondmate-parent-lib.sh \
+  fm-linked-projects-lib.sh \
   fm-pending-reply-lib.sh \
   fm-operational-input.sh \
   fm-marker-lib.sh \
@@ -397,6 +406,8 @@ unset _teardown_source
 . "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
 # shellcheck source=bin/fm-secondmate-parent-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
+# shellcheck source=bin/fm-linked-projects-lib.sh
+. "$SCRIPT_DIR/fm-linked-projects-lib.sh"
 # shellcheck source=bin/fm-pending-reply-lib.sh
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
@@ -3041,6 +3052,97 @@ preflight_descendant_treehouse_slots() {
   done
 }
 
+# Linked projects of the retiring home: one "<project>\t<target>" line per landed
+# linked repository that retirement removes once the home itself is gone.
+LINKED_RETIRE_PLAN=
+LINKED_RETIRE_SELF=
+LINKED_RETIRE_ROOT=
+
+# Refuse a non-forced retirement with <message>; a forced one keeps the linked
+# repository in place and continues.
+linked_project_refuse_or_keep() {
+  if [ "$FORCE" = "--force" ]; then
+    echo "warning: $1; --force keeps that linked repository in place" >&2
+    return 0
+  fi
+  echo "REFUSED: $1; nothing was changed" >&2
+  return 1
+}
+
+linked_projects_retire_preflight() {
+  local home=$1 rc=0 entries project target link current abs reason
+  LINKED_RETIRE_PLAN=
+  LINKED_RETIRE_SELF=$(fm_lp_canonical "$home") || return 1
+  if fm_lp_manifest_read "$home"; then
+    :
+  else
+    rc=$?
+    [ "$rc" -ne 1 ] || return 0
+    echo "REFUSED: $FM_LP_ERROR" >&2
+    return 1
+  fi
+  LINKED_RETIRE_ROOT=$FM_LP_ROOT
+  entries=$FM_LP_ENTRIES
+  while IFS=$'\t' read -r project target; do
+    [ -n "$project" ] || continue
+    link="$home/projects/$project"
+    if [ ! -L "$link" ]; then
+      if [ -e "$link" ]; then
+        echo "REFUSED: linked project $project at $link is no longer a link; reconcile it before retiring" >&2
+        return 1
+      fi
+      echo "warning: linked project $project is no longer linked at $link; leaving $target in place" >&2
+      continue
+    fi
+    current=$(fm_lp_link_target "$link") || current=
+    if [ "$current" != "$target" ]; then
+      linked_project_refuse_or_keep "linked project $project link $link points to ${current:-an unreadable target}, not its recorded $target" || return 1
+      continue
+    fi
+    [ -e "$target" ] || [ -L "$target" ] || continue
+    if ! abs=$(fm_lp_check_target "$FM_HOME" "$FM_ROOT" "$home" "$LINKED_RETIRE_ROOT" "$project" "$target"); then
+      linked_project_refuse_or_keep "linked project $project target $target fails its containment checks" || return 1
+      continue
+    fi
+    if [ "$abs" != "$target" ] || [ -L "$abs" ] || [ ! -d "$abs" ]; then
+      linked_project_refuse_or_keep "linked project $project target $target no longer resolves to itself" || return 1
+      continue
+    fi
+    if ! reason=$(fm_lp_unlanded_reason "$abs"); then
+      linked_project_refuse_or_keep "linked project $project: $reason" || return 1
+      continue
+    fi
+    LINKED_RETIRE_PLAN="$LINKED_RETIRE_PLAN$project	$abs
+"
+  done <<EOF
+$entries
+EOF
+}
+
+# Runs after the home is removed, so every failure here keeps the repository
+# and warns rather than stopping a retirement that has already happened.
+linked_projects_retire_apply() {
+  local project target abs reason
+  while IFS=$'\t' read -r project target; do
+    [ -n "$project" ] || continue
+    if ! abs=$(fm_lp_check_target "$FM_HOME" "$FM_ROOT" "$LINKED_RETIRE_SELF" "$LINKED_RETIRE_ROOT" "$project" "$target"); then
+      echo "warning: linked project $project target $target failed its containment checks after the home was removed; leaving it in place" >&2
+      continue
+    fi
+    if [ "$abs" != "$target" ] || [ -L "$abs" ] || [ ! -d "$abs" ]; then
+      echo "warning: linked project $project target $target changed after the home was removed; leaving it in place" >&2
+      continue
+    fi
+    if ! reason=$(fm_lp_unlanded_reason "$abs"); then
+      echo "warning: linked project $project: $reason since the retirement check; leaving it in place" >&2
+      continue
+    fi
+    rm -rf -- "$abs" || echo "warning: could not fully remove linked project $project repository $abs" >&2
+  done <<EOF
+$LINKED_RETIRE_PLAN
+EOF
+}
+
 validate_firstmate_home_children_removal() {
   local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
   sub_state="$home/state"
@@ -3427,6 +3529,7 @@ fi
 
 if [ "$KIND" = secondmate ]; then
   preflight_firstmate_home_process_event_tree "$HOME_PATH" "secondmate home" || exit 1
+  linked_projects_retire_preflight "$HOME_PATH" || exit 1
 fi
 
 if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
@@ -3798,6 +3901,7 @@ if [ "$KIND" = secondmate ]; then
       || echo "error: receiver wake restoration failed; recovery state remains at $HANDOFF_WAKE_RETIRE_STAGE" >&2
     exit "$rc"
   fi
+  linked_projects_retire_apply
   handoff_wake_retire_stage_commit \
     || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
   if [ "$PENDING_REPLIES_DIR_PRESENT" -eq 1 ]; then

@@ -2,7 +2,7 @@
 # Provision and route persistent secondmate homes.
 #
 # Usage:
-#   fm-home-seed.sh <id> <home|-> {<project>...|--no-projects}
+#   fm-home-seed.sh <id> <home|-> [--link-root <dir>] {<project>[=<repo-path>]...|--no-projects}
 #       Provision <home> as an isolated firstmate home. If <home> is "-", acquire
 #       a fresh firstmate worktree via "treehouse get --lease", which durably
 #       leases the worktree under the secondmate <id> so the home survives with
@@ -22,6 +22,17 @@
 #       generated briefs, new homes, new project clones, and registry edits are
 #       rolled back. Treehouse-acquired homes are returned only when the rollback
 #       target is safe; a failed return warns because the lease may still be held.
+#       A <project>=<repo-path> spec links the project instead of cloning it
+#       into the home: projects/<project> becomes a symlink to the absolute
+#       <repo-path>, which must resolve to <link-root>/<project-dir>/code/<repo>.
+#       --link-root names the home's one link root, an absolute org directory;
+#       a home that already declares one keeps it, and a different value is
+#       refused. A missing target is cloned (its code/ parent must already
+#       exist; the project root, docs/, and data/ are never created); an existing
+#       one is adopted only when its origin matches, as for existing clones.
+#       bin/fm-linked-projects-lib.sh owns the manifest, the containment rules,
+#       and the cleanup scope; rollback reruns those checks and removes only a
+#       target this seed cloned plus the link it created.
 #       Set FM_SECONDMATE_CHARTER='<charter>' to seed from inline charter text
 #       when no filled charter brief exists. Set FM_SECONDMATE_SCOPE='<scope>'
 #       to override the registry routing scope. Otherwise the registry summary
@@ -49,9 +60,11 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-secondmate-charter-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-linked-projects-lib.sh
+. "$SCRIPT_DIR/fm-linked-projects-lib.sh"
 
 usage() {
-  echo "usage: fm-home-seed.sh <id> <home|-> {<project>...|--no-projects}" >&2
+  echo "usage: fm-home-seed.sh <id> <home|-> [--link-root <dir>] {<project>[=<repo-path>]...|--no-projects}" >&2
   echo "       fm-home-seed.sh validate" >&2
 }
 
@@ -498,6 +511,152 @@ EOF
   git clone --quiet "$url" "$dst"
 }
 
+# Linked-project seed state: "<project>\t<repo-path>" specs from the command
+# line and the resolved link root they are checked against.
+SEED_LINK_SPECS=
+SEED_LINK_ROOT=
+SEED_LINK_MANIFEST_EXISTED=0
+SEED_CREATED_LINKED_FILE=
+SEED_CREATED_LINKS_FILE=
+
+seed_link_spec_for() {  # <project>
+  local project=$1 name spec
+  while IFS='	' read -r name spec; do
+    [ -n "$name" ] || continue
+    if [ "$name" = "$project" ]; then
+      printf '%s\n' "$spec"
+      return 0
+    fi
+  done <<EOF
+$SEED_LINK_SPECS
+EOF
+  return 1
+}
+
+check_linked_target() {  # <home> <project> <repo-path>
+  fm_lp_check_target "$FM_HOME" "$FM_ROOT" "$1" "$SEED_LINK_ROOT" "$2" "$3"
+}
+
+# Resolve a linked project's repository for a seed step that is about to act on
+# it: the containment checks pass and projects/<project> links to exactly it.
+linked_project_destination() {  # <home> <project>
+  local home=$1 project=$2 spec target current
+  spec=$(seed_link_spec_for "$project") || return 1
+  target=$(check_linked_target "$home" "$project" "$spec") || return 1
+  current=$(fm_lp_link_target "$home/projects/$project") || {
+    echo "error: linked project $project has no link at $home/projects/$project" >&2
+    return 1
+  }
+  if [ "$current" != "$target" ]; then
+    echo "error: linked project $project link $home/projects/$project points to $current, not $target" >&2
+    return 1
+  fi
+  printf '%s\n' "$target"
+}
+
+link_project() {
+  local project=$1 home=$2 spec src link target current mode mode_line url dst_url top entries abs_home abs_projects
+  spec=$(seed_link_spec_for "$project") || return 1
+  src="$PROJECTS/$project"
+  link="$home/projects/$project"
+  abs_home=$(resolved_path "$home")
+  abs_projects=$(resolved_path "$home/projects")
+  if ! path_is_ancestor_of "$abs_home" "$abs_projects"; then
+    echo "error: secondmate projects directory must resolve inside the secondmate home: $home/projects" >&2
+    return 1
+  fi
+  target=$(check_linked_target "$home" "$project" "$spec") || return 1
+  mode_line=$(registered_posture_line "$project") || return 1
+  read -r mode _ <<EOF
+$mode_line
+EOF
+  if [ "$mode" = local-only ]; then
+    echo "error: project $project is local-only; secondmate routes support only no-mistakes and direct-PR projects" >&2
+    return 1
+  fi
+  if [ -L "$link" ]; then
+    current=$(fm_lp_link_target "$link") || current=
+    if [ "$current" != "$target" ]; then
+      echo "error: seeded project $project already links to ${current:-an unreadable target}, not $target" >&2
+      return 1
+    fi
+  elif [ -e "$link" ]; then
+    echo "error: seeded project $project exists at $link and is not a link to $target" >&2
+    return 1
+  fi
+  url=$(source_origin_url "$project" "$mode" "$src") || return 1
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if [ ! -d "$target" ] || [ -L "$target" ]; then
+      echo "error: linked project $project target $target exists but is not a directory" >&2
+      return 1
+    fi
+    top=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) || top=
+    if [ -z "$top" ] || ! [ "$top" -ef "$target" ]; then
+      echo "error: linked project $project target $target is not the root of a git repository" >&2
+      return 1
+    fi
+    dst_url=$(seeded_origin_url "$project" "$target" "$url") || return 1
+    if [ "$dst_url" != "$url" ]; then
+      echo "error: linked project $project at $target has origin $dst_url; expected $url" >&2
+      return 1
+    fi
+  else
+    if [ ! -d "$(dirname "$target")" ]; then
+      echo "error: linked project $project needs the existing code folder $(dirname "$target"); seeding never creates a project root, code/, docs/, or data/" >&2
+      return 1
+    fi
+    printf '%s\t%s\t%s\n' "$project" "$link" "$target" >> "$SEED_CREATED_LINKED_FILE"
+    git clone --quiet "$url" "$target"
+  fi
+  if [ ! -L "$link" ]; then
+    printf '%s\t%s\n' "$link" "$target" >> "$SEED_CREATED_LINKS_FILE"
+    ln -s -- "$target" "$link"
+  fi
+  entries=
+  if fm_lp_manifest_read "$home"; then
+    entries=$(printf '%s' "$FM_LP_ENTRIES" | awk -F '\t' -v p="$project" '$1 != p')
+  fi
+  entries="$entries${entries:+
+}$project	$target"
+  fm_lp_manifest_write "$home" "$SEED_LINK_ROOT" "$entries"
+}
+
+# Resolve the home's link root from --link-root and any manifest the home
+# already has, so every later step checks against one recorded value.
+resolve_seed_link_root() {  # <home> <requested-link-root>
+  local home=$1 requested=$2 existing='' rc=0 resolved
+  if fm_lp_manifest_read "$home"; then
+    existing=$FM_LP_ROOT
+  else
+    rc=$?
+    if [ "$rc" -ne 1 ]; then
+      printf 'error: %s\n' "$FM_LP_ERROR" >&2
+      return 1
+    fi
+  fi
+  if [ -n "$requested" ]; then
+    resolved=$(fm_lp_link_root_resolve "$requested") || return 1
+    if [ -n "$existing" ] && [ "$existing" != "$resolved" ]; then
+      echo "error: secondmate home $home already declares link root $existing; refusing --link-root $resolved" >&2
+      return 1
+    fi
+    SEED_LINK_ROOT=$resolved
+  elif [ -n "$existing" ]; then
+    resolved=$(fm_lp_link_root_resolve "$existing") || return 1
+    if [ "$resolved" != "$existing" ]; then
+      echo "error: secondmate home $home link root $existing no longer resolves to itself ($resolved)" >&2
+      return 1
+    fi
+    SEED_LINK_ROOT=$existing
+  fi
+  if [ -n "$SEED_LINK_SPECS" ] && [ -z "$SEED_LINK_ROOT" ]; then
+    echo "error: linked projects need a link root; pass --link-root <dir>" >&2
+    return 1
+  fi
+  [ -n "$SEED_LINK_ROOT" ] || return 0
+  fm_lp_manifest_write "$home" "$SEED_LINK_ROOT" "$FM_LP_ENTRIES"
+}
+
 validate_seed_project() {
   local project=$1 src mode url mode_line
   src="$PROJECTS/$project"
@@ -631,6 +790,44 @@ seed_remove_created_project() {
   rm -rf -- "$abs_project" 2>/dev/null || true
 }
 
+# Undo this seed's linked projects before the home itself is rolled back: a
+# cloned target is removed only while its link still points at it and every
+# containment check passes again, and an adopted target keeps everything except
+# the link this seed created.
+seed_rollback_linked_projects() {
+  local project link target current abs
+  if [ -n "${SEED_CREATED_LINKED_FILE:-}" ] && [ -f "$SEED_CREATED_LINKED_FILE" ]; then
+    while IFS='	' read -r project link target; do
+      [ -n "$target" ] || continue
+      if [ -L "$link" ]; then
+        current=$(fm_lp_link_target "$link" 2>/dev/null) || current=
+        if [ "$current" != "$target" ]; then
+          echo "REFUSED: linked project $project link $link now points to ${current:-an unreadable target}, not the cloned $target; leaving it in place" >&2
+          continue
+        fi
+      fi
+      [ -e "$target" ] || [ -L "$target" ] || continue
+      if ! abs=$(check_linked_target "$SEED_HOME" "$project" "$target"); then
+        echo "REFUSED: unsafe linked project rollback target $target; leaving it in place" >&2
+        continue
+      fi
+      if [ "$abs" != "$target" ] || [ -L "$abs" ] || [ ! -d "$abs" ]; then
+        echo "REFUSED: linked project rollback target $target changed since it was cloned; leaving it in place" >&2
+        continue
+      fi
+      rm -rf -- "$abs" 2>/dev/null || true
+    done < "$SEED_CREATED_LINKED_FILE"
+  fi
+  if [ -n "${SEED_CREATED_LINKS_FILE:-}" ] && [ -f "$SEED_CREATED_LINKS_FILE" ]; then
+    while IFS='	' read -r link target; do
+      [ -n "$link" ] || continue
+      if [ -L "$link" ]; then
+        rm -f -- "$link" 2>/dev/null || true
+      fi
+    done < "$SEED_CREATED_LINKS_FILE"
+  fi
+}
+
 seed_project_was_created() {
   local project_path=$1
   [ -n "${SEED_CREATED_PROJECTS_FILE:-}" ] || return 1
@@ -651,6 +848,7 @@ seed_rollback() {
   fi
 
   if [ -n "${SEED_HOME:-}" ] && [ "$SEED_HOME" != "/" ]; then
+    seed_rollback_linked_projects
     if [ "$SEED_HOME_ACQUIRED" = 1 ]; then
       seed_return_treehouse_home "$SEED_HOME"
     elif [ "$SEED_HOME_CREATED" = 1 ]; then
@@ -667,6 +865,7 @@ seed_rollback() {
         restore_seed_file "$SEED_PARENT_MARKER_EXISTED" "$SEED_BACKUP_DIR/parent-marker" "$SEED_HOME/$SUB_HOME_PARENT_MARKER"
         restore_seed_file "$SEED_CHARTER_EXISTED" "$SEED_BACKUP_DIR/charter.md" "$SEED_HOME/data/charter.md"
         restore_seed_file "$SEED_SUB_REG_EXISTED" "$SEED_BACKUP_DIR/sub-projects.md" "$SEED_HOME/data/projects.md"
+        restore_seed_file "$SEED_LINK_MANIFEST_EXISTED" "$SEED_BACKUP_DIR/linked-projects" "$(fm_lp_manifest_file "$SEED_HOME")"
       fi
     fi
   fi
@@ -740,7 +939,11 @@ initialize_no_mistakes_project() {
   local home=$1 project=$2 created=$3 mode dst
   mode=$(project_mode_in_home "$home" "$project") || return 1
   [ "$mode" = no-mistakes ] || return 0
-  dst=$(validate_project_destination "$home" "$project") || return 1
+  if seed_link_spec_for "$project" >/dev/null; then
+    dst=$(linked_project_destination "$home" "$project") || return 1
+  else
+    dst=$(validate_project_destination "$home" "$project") || return 1
+  fi
   if git -C "$dst" remote get-url no-mistakes >/dev/null 2>&1; then
     return 0
   fi
@@ -839,18 +1042,49 @@ refuse_projectful_projectless_charter() {
 
 seed_home() {
   local id=$1 requested_home=$2 requested_abs home projects_csv project project_dst charter_summary charter_scope
-  local no_projects=0 arg
+  local no_projects=0 arg name spec requested_link_root=''
   local filtered=()
   shift 2
   # A deliberate --no-projects signal (anywhere in the project position) seeds a
   # project-less home; an accidental omission with no signal still fails loudly.
-  for arg in "$@"; do
-    if [ "$arg" = "--no-projects" ]; then
-      no_projects=1
-    else
-      filtered+=("$arg")
-    fi
+  SEED_LINK_SPECS=
+  while [ $# -gt 0 ]; do
+    arg=$1
+    shift
+    case "$arg" in
+      --no-projects) no_projects=1 ;;
+      --link-root)
+        [ $# -gt 0 ] || { echo "error: --link-root needs a directory" >&2; return 1; }
+        requested_link_root=$1
+        shift
+        ;;
+      --link-root=*) requested_link_root=${arg#--link-root=} ;;
+      *=*)
+        name=${arg%%=*}
+        spec=${arg#*=}
+        fm_lp_valid_project_name "$name" || { echo "error: invalid linked project name: $name" >&2; return 1; }
+        case "$spec" in
+          /*) ;;
+          *) echo "error: linked project $name repository path must be absolute: $spec" >&2; return 1 ;;
+        esac
+        case "$spec" in
+          *'	'*|*$'\n'*) echo "error: linked project $name repository path contains a tab or newline" >&2; return 1 ;;
+        esac
+        if seed_link_spec_for "$name" >/dev/null; then
+          echo "error: linked project $name is listed more than once" >&2
+          return 1
+        fi
+        SEED_LINK_SPECS="$SEED_LINK_SPECS$name	$spec
+"
+        filtered+=("$name")
+        ;;
+      *) filtered+=("$arg") ;;
+    esac
   done
+  if [ -n "$requested_link_root" ] && [ "$no_projects" -eq 1 ]; then
+    echo "error: --link-root cannot be combined with --no-projects" >&2
+    return 1
+  fi
   if [ "${#filtered[@]}" -gt 0 ]; then
     set -- "${filtered[@]}"
   else
@@ -883,6 +1117,12 @@ seed_home() {
   SEED_BACKUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-home-seed.XXXXXX")
   SEED_CREATED_PROJECTS_FILE="$SEED_BACKUP_DIR/created-projects"
   : > "$SEED_CREATED_PROJECTS_FILE"
+  SEED_CREATED_LINKED_FILE="$SEED_BACKUP_DIR/created-linked"
+  : > "$SEED_CREATED_LINKED_FILE"
+  SEED_CREATED_LINKS_FILE="$SEED_BACKUP_DIR/created-links"
+  : > "$SEED_CREATED_LINKS_FILE"
+  SEED_LINK_ROOT=
+  SEED_LINK_MANIFEST_EXISTED=0
   SEED_PARENT_REG_EXISTED=0
   SEED_PARENT_BRIEF="$DATA/$id/brief.md"
   SEED_PARENT_BRIEF_CREATED=0
@@ -937,7 +1177,12 @@ seed_home() {
     SEED_PARENT_MARKER_EXISTED=1
     cp "$home/$SUB_HOME_PARENT_MARKER" "$SEED_BACKUP_DIR/parent-marker"
   fi
+  if [ -f "$(fm_lp_manifest_file "$home")" ] && [ ! -L "$(fm_lp_manifest_file "$home")" ]; then
+    SEED_LINK_MANIFEST_EXISTED=1
+    cp "$(fm_lp_manifest_file "$home")" "$SEED_BACKUP_DIR/linked-projects"
+  fi
   SEED_HOME_BACKED_UP=1
+  resolve_seed_link_root "$home" "$requested_link_root" || return 1
 
   if [ ! -f "$SEED_PARENT_BRIEF" ]; then
     [ -n "${FM_SECONDMATE_CHARTER:-}" ] || {
@@ -968,12 +1213,25 @@ seed_home() {
   }
 
   for project in "$@"; do
+    if seed_link_spec_for "$project" >/dev/null; then
+      link_project "$project" "$home"
+      continue
+    fi
     project_dst=$(validate_project_destination "$home" "$project") || return 1
     [ -e "$project_dst" ] || printf '%s\n' "$project_dst" >> "$SEED_CREATED_PROJECTS_FILE"
     clone_project "$project" "$home"
   done
   sync_project_registry "$home" "$@"
   for project in "$@"; do
+    if seed_link_spec_for "$project" >/dev/null; then
+      project_dst=$(linked_project_destination "$home" "$project") || return 1
+      if awk -F '\t' -v t="$project_dst" '$3 == t { found = 1 } END { exit found ? 0 : 1 }' "$SEED_CREATED_LINKED_FILE"; then
+        initialize_no_mistakes_project "$home" "$project" 1
+      else
+        initialize_no_mistakes_project "$home" "$project" 0
+      fi
+      continue
+    fi
     project_dst=$(validate_project_destination "$home" "$project") || return 1
     if seed_project_was_created "$project_dst"; then
       initialize_no_mistakes_project "$home" "$project" 1
