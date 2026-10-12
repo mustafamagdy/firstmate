@@ -24,11 +24,13 @@
 #       target is safe; a failed return warns because the lease may still be held.
 #       A <project>=<repo-path> spec links the project instead of cloning it
 #       into the home: projects/<project> becomes a symlink to the absolute
-#       <repo-path>, which must resolve to <link-root>/<project-dir>/code/<repo>.
+#       <repo-path>, which must resolve to <link-root>/<project-dir>/code/<repo>
+#       or, with one optional group level, <link-root>/<project-dir>/code/<group>/<repo>.
 #       --link-root names the home's one link root, an absolute org directory;
 #       a home that already declares one keeps it, and a different value is
-#       refused. A missing target is cloned (its code/ parent must already
-#       exist; the project root, docs/, and data/ are never created); an existing
+#       refused. A missing target is cloned only when its parent, code/ or
+#       code/<group>/, already exists (the project root, code/, a group
+#       directory, README.md, docs/, and data/ are never created); an existing
 #       one is adopted only when its origin matches, as for existing clones.
 #       bin/fm-linked-projects-lib.sh owns the manifest, the containment rules,
 #       and the cleanup scope; rollback reruns those checks and removes only a
@@ -602,7 +604,7 @@ EOF
     fi
   else
     if [ ! -d "$(dirname "$target")" ]; then
-      echo "error: linked project $project needs the existing code folder $(dirname "$target"); seeding never creates a project root, code/, docs/, or data/" >&2
+      echo "error: linked project $project needs the existing code folder $(dirname "$target"); seeding never creates a project root, code/, a group directory, docs/, or data/" >&2
       return 1
     fi
     printf '%s\t%s\t%s\n' "$project" "$link" "$target" >> "$SEED_CREATED_LINKED_FILE"

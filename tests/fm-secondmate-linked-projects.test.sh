@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # tests/fm-secondmate-linked-projects.test.sh - linked projects for local
 # secondmate homes: seeding a projects/<project> link to a repository in the
-# <link-root>/<project-dir>/code/<repo> workspace layout (new clone and adopt),
-# every containment refusal, rollback removing only a cloned code/<repo>
-# directory, symlink retargeting between seed and rollback, retirement leaving
-# every linked repository in place, consumers that work through the link, and
-# unchanged behavior for a home with no link root.
+# <link-root>/<project-dir>/code/[<group>/]<repo> workspace layout (new clone and
+# adopt, grouped and ungrouped), every containment refusal, rollback removing
+# only a cloned repository directory, symlink retargeting between seed and
+# rollback, retirement leaving every linked repository in place, consumers that
+# work through the link, the product context in generated briefs, and unchanged
+# behavior for a home with no link root.
 set -u
 
 # shellcheck source=tests/secondmate-helpers.sh disable=SC1091
@@ -141,6 +142,66 @@ test_seed_adopts_existing_target_only_with_matching_origin() {
   pass "seed adopts an existing target only when its origin matches and never removes it"
 }
 
+# One product whose repositories are grouped under code/<group>/ next to an
+# ungrouped one: a grouped clone, a grouped adopt, and an ungrouped clone.
+test_seed_links_grouped_and_ungrouped_repos_of_one_product() {
+  local sub clone adopted plain out
+  new_world seed-grouped
+  make_org_project xelta
+  mkdir -p "$ORG/xelta/code/enterprise" "$ORG/xelta/code/v1-b2b"
+  fm_git_init_commit "$ORG/xelta/code/enterprise/sibling"
+  clone="$ORG/xelta/code/enterprise/alpha"
+  adopted="$ORG/xelta/code/v1-b2b/beta"
+  plain="$ORG/xelta/code/gamma"
+  git clone --quiet "$(git -C "$MAIN/projects/beta" remote get-url origin)" "$adopted"
+  printf 'local scratch\n' > "$adopted/.git/fm-adopt-marker"
+  sub="$W/sub"
+  out=$(seed design "$sub" --link-root "$ORG" "alpha=$clone" "beta=$adopted" "gamma=$plain" 2>&1) \
+    || fail "grouped linked seed failed: $out"
+  [ "$(cd "$sub/projects/alpha" && pwd -P)" = "$(cd "$clone" && pwd -P)" ] || fail "projects/alpha does not resolve to the grouped clone"
+  [ "$(git -C "$clone" remote get-url origin)" = "$(git -C "$MAIN/projects/alpha" remote get-url origin)" ] \
+    || fail "grouped clone did not keep the project's origin"
+  [ "$(cd "$sub/projects/beta" && pwd -P)" = "$(cd "$adopted" && pwd -P)" ] || fail "projects/beta does not resolve to the grouped adopted repo"
+  assert_present "$adopted/.git/fm-adopt-marker" "grouped adoption replaced the existing repository"
+  [ "$(cd "$sub/projects/gamma" && pwd -P)" = "$(cd "$plain" && pwd -P)" ] || fail "projects/gamma does not resolve to the ungrouped clone"
+  assert_grep "link.alpha=$(cd "$clone" && pwd -P)" "$sub/config/linked-projects" "manifest did not record the grouped clone"
+  assert_grep "link.beta=$(cd "$adopted" && pwd -P)" "$sub/config/linked-projects" "manifest did not record the grouped adopt"
+  assert_grep "link.gamma=$(cd "$plain" && pwd -P)" "$sub/config/linked-projects" "manifest did not record the ungrouped clone"
+  assert_present "$ORG/xelta/code/enterprise/sibling/.git" "grouped seed disturbed a sibling in the group"
+  assert_org_project_intact xelta "grouped seed"
+  FM_HOME="$MAIN" "$ROOT/bin/fm-home-seed.sh" validate >/dev/null || fail "registry validation failed for a grouped linked home"
+  pass "seed links grouped clones, grouped adopts, and ungrouped repos of one product in one home"
+}
+
+test_seed_refuses_group_and_repo_overlap() {
+  local other
+  new_world group-overlap
+  make_org_project xelta
+  mkdir -p "$ORG/xelta/code/enterprise"
+  # In one home: a repository in the group, then the group itself as a repository.
+  expect_seed_refusal "a group directory linked next to a repository inside it" "already linked as project alpha" \
+    --link-root "$ORG" "alpha=$ORG/xelta/code/enterprise/alpha" "beta=$ORG/xelta/code/enterprise"
+  assert_absent "$ORG/xelta/code/enterprise/alpha" "a refused overlapping seed left its clone"
+  assert_present "$ORG/xelta/code/enterprise" "a refused overlapping seed removed the group directory"
+  # Across homes, in both directions.
+  other="$W/other-sub"
+  seed other "$other" --link-root "$ORG" "alpha=$ORG/xelta/code/enterprise/alpha" >/dev/null 2>&1 \
+    || fail "could not seed the grouped linked secondmate"
+  expect_seed_refusal "a group directory whose repository another home links" "linked project of firstmate home" \
+    --link-root "$ORG" "beta=$ORG/xelta/code/enterprise"
+  mkdir -p "$ORG/xelta/code/platform"
+  seed other "$other" --link-root "$ORG" "beta=$ORG/xelta/code/platform" >/dev/null 2>&1 \
+    && fail "seed linked a plain group directory as a repository"
+  rm -rf "$W/third-sub"
+  git clone --quiet "$(git -C "$MAIN/projects/beta" remote get-url origin)" "$ORG/xelta/code/platform-repo"
+  seed third "$W/third-sub" --link-root "$ORG" "beta=$ORG/xelta/code/platform-repo" >/dev/null 2>&1 \
+    || fail "could not seed the home that links a repository as code/<repo>"
+  expect_seed_refusal "a grouped target inside another home's linked repository" "linked project of firstmate home" \
+    --link-root "$ORG" "gamma=$ORG/xelta/code/platform-repo/gamma"
+  assert_org_project_intact xelta "group overlap refusals"
+  pass "seed refuses a group directory and a repository inside it being linked together, in one home or across homes"
+}
+
 # Seed once and expect a refusal naming <pattern>, with the target untouched.
 expect_seed_refusal() {  # <label> <pattern> <seed args...>
   local label=$1 pattern=$2 err="$W/refusal.err" sub="$W/refused-sub"
@@ -172,8 +233,15 @@ test_seed_refuses_every_containment_violation() {
     --link-root "$ORG" "alpha=$ORG/alpha-proj/alpha"
   expect_seed_refusal "a target that is the code/ folder" "must have the shape" \
     --link-root "$ORG" "alpha=$ORG/alpha-proj/code"
-  expect_seed_refusal "a target nested below code/<repo>" "must have the shape" \
-    --link-root "$ORG" "alpha=$ORG/alpha-proj/code/alpha/deeper"
+  expect_seed_refusal "a target two group levels below code/" "must have the shape" \
+    --link-root "$ORG" "alpha=$ORG/alpha-proj/code/g1/g2/alpha"
+  expect_seed_refusal "a target nested below code/<group>/<repo>" "must have the shape" \
+    --link-root "$ORG" "alpha=$ORG/alpha-proj/code/g1/alpha/deeper"
+  expect_seed_refusal "a target inside an existing repository under code/" "a group directory must not be a repository" \
+    --link-root "$ORG" "alpha=$ORG/alpha-proj/code/sibling/alpha"
+  expect_seed_refusal "a missing group directory" "needs the existing code folder" \
+    --link-root "$ORG" "alpha=$ORG/alpha-proj/code/new-group/alpha"
+  assert_absent "$ORG/alpha-proj/code/new-group" "seed created a group directory"
   expect_seed_refusal "the project root itself" "must have the shape" \
     --link-root "$ORG" "alpha=$ORG/alpha-proj"
   expect_seed_refusal "a target escaping through .." "outside the link root" \
@@ -243,7 +311,7 @@ EOF
   assert_present "$code_root/AGENTS.md" "code-root refusal touched the firstmate code root"
 
   assert_org_project_intact alpha-proj "containment refusals"
-  pass "seed refuses targets outside the root, off-shape, missing code/, or overlapping any home, code root, or linked target"
+  pass "seed refuses targets outside the root, off-shape, missing code/ or group, or overlapping any home, code root, or linked target"
 }
 
 # --- rollback -----------------------------------------------------------------
@@ -272,6 +340,26 @@ test_rollback_removes_only_the_cloned_code_repo() {
   assert_org_project_intact alpha-proj "rollback"
   assert_org_project_intact gamma-proj "rollback"
   pass "rollback removes only the cloned code/<repo> and its link; adopted repos and project folders survive"
+}
+
+test_rollback_keeps_the_group_and_its_siblings() {
+  local sub new_target
+  new_world rollback-grouped
+  make_org_project xelta
+  mkdir -p "$ORG/xelta/code/enterprise"
+  fm_git_init_commit "$ORG/xelta/code/enterprise/sibling"
+  new_target="$ORG/xelta/code/enterprise/gamma"
+  sub="$W/sub"
+  mark_firstmate_home "$sub"
+  if FM_FAKE_NO_MISTAKES_FAIL_PROJECT=gamma seed design "$sub" --link-root "$ORG" "gamma=$new_target" >/dev/null 2>"$W/rollback.err"; then
+    fail "seed succeeded although no-mistakes initialization failed"
+  fi
+  assert_absent "$new_target" "rollback left the grouped cloned repository"
+  [ ! -L "$sub/projects/gamma" ] || fail "rollback left the grouped link"
+  assert_present "$ORG/xelta/code/enterprise" "rollback removed the group directory"
+  assert_present "$ORG/xelta/code/enterprise/sibling/.git" "rollback removed a sibling repository in the group"
+  assert_org_project_intact xelta "grouped rollback"
+  pass "rollback removes only the grouped clone and its link; the group directory and its siblings survive"
 }
 
 test_rollback_refuses_a_retargeted_link() {
@@ -363,6 +451,30 @@ test_forced_retirement_keeps_every_linked_repo() {
   pass "forced retirement removes only the home and its links; every linked repository survives"
 }
 
+test_brief_names_the_product_of_a_linked_project() {
+  local sub brief root
+  new_world brief-product
+  make_org_project xelta
+  make_org_project other
+  mkdir -p "$ORG/xelta/code/enterprise"
+  sub="$W/sub"
+  seed design "$sub" --link-root "$ORG" "alpha=$ORG/xelta/code/enterprise/alpha" "gamma=$ORG/xelta/code/gamma" beta >/dev/null 2>&1 \
+    || fail "could not seed the product home"
+  root=$(cd "$ORG" && pwd -P)
+  FM_HOME="$sub" "$ROOT/bin/fm-brief.sh" ship-alpha alpha --mode direct-PR >/dev/null || fail "ship brief for a linked project failed"
+  brief="$sub/data/ship-alpha/brief.md"
+  assert_grep '# Product context (read-only)' "$brief" "ship brief for a linked project has no product section"
+  assert_grep 'repository of the product `xelta`' "$brief" "product section did not name the product"
+  assert_grep "Product root: \`$root/xelta\`" "$brief" "product section did not name the product root"
+  assert_grep "\`gamma\` at \`$root/xelta/code/gamma\`" "$brief" "product section did not list the sibling project"
+  assert_no_grep '`beta`' "$brief" "product section listed an unlinked project"
+  FM_HOME="$sub" "$ROOT/bin/fm-brief.sh" scout-gamma gamma --scout >/dev/null || fail "scout brief for a linked project failed"
+  assert_grep "\`alpha\` at \`$root/xelta/code/enterprise/alpha\`" "$sub/data/scout-gamma/brief.md" "scout product section did not list the grouped sibling"
+  FM_HOME="$sub" "$ROOT/bin/fm-brief.sh" ship-beta beta --mode direct-PR >/dev/null || fail "ship brief for an unlinked project failed"
+  assert_no_grep 'Product context' "$sub/data/ship-beta/brief.md" "an unlinked project's brief has a product section"
+  pass "ship and scout briefs name a linked project's product, root, and sibling projects; an unlinked project gets none"
+}
+
 test_home_without_link_root_is_unchanged() {
   local sub err
   new_world no-link-root
@@ -387,9 +499,13 @@ test_home_without_link_root_is_unchanged() {
 
 test_seed_links_new_clone_and_consumers_work_through_it
 test_seed_adopts_existing_target_only_with_matching_origin
+test_seed_links_grouped_and_ungrouped_repos_of_one_product
 test_seed_refuses_every_containment_violation
+test_seed_refuses_group_and_repo_overlap
 test_rollback_removes_only_the_cloned_code_repo
+test_rollback_keeps_the_group_and_its_siblings
 test_rollback_refuses_a_retargeted_link
 test_retirement_keeps_every_linked_repo
 test_forced_retirement_keeps_every_linked_repo
+test_brief_names_the_product_of_a_linked_project
 test_home_without_link_root_is_unchanged

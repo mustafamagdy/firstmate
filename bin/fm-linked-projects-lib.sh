@@ -5,9 +5,10 @@
 # a linked repository. Retirement never removes a linked repository.
 #
 # A local secondmate home may keep a project repository outside the home, in the
-# standard workspace layout <link-root>/<project-dir>/code/<repo>, reached through
-# a symlink at <home>/projects/<project>. The home declares its one link root and
-# every linked target in the gitignored manifest <home>/config/linked-projects:
+# standard workspace layout <link-root>/<project-dir>/code/[<group>/]<repo>,
+# reached through a symlink at <home>/projects/<project>. The home declares its
+# one link root and every linked target in the gitignored manifest
+# <home>/config/linked-projects:
 #
 #   schema=fm-linked-projects.v1
 #   link_root=<absolute resolved org directory, such as /home/me/work/mbg>
@@ -19,14 +20,21 @@
 # NUL-bearing, or malformed manifest is refused rather than read.
 #
 # A linked target is accepted only when its fully resolved path is exactly
-# <link-root>/<one dir>/code/<one dir>, and is not inside, equal to, or an
-# ancestor of the firstmate code root, any firstmate home this home can reach
-# (the active home, its local parent chain up to the main home, every local home
-# registered under any of them, and the secondmate home itself), any other home's
-# linked project target, or another project's target in the same home.
-# Seed rollback removes only a resolved code/<repo> directory that seed itself
-# cloned, plus the projects/<project> link; it never removes code/ itself, the
-# project root, README.md, docs/, data/, or sibling repositories.
+# <link-root>/<project-dir>/code/<repo> or, for a product whose repositories are
+# grouped, <link-root>/<project-dir>/code/<group>/<repo>: one optional group
+# level, never deeper, and a group directory is never itself a git repository.
+# The target must not be inside, equal to, or an ancestor of the firstmate code
+# root, any firstmate home this home can reach (the active home, its local parent
+# chain up to the main home, every local home registered under any of them, and
+# the secondmate home itself), any other home's linked project target, or another
+# project's target in the same home, so a group directory linked as a repository
+# and a repository inside it are never both linked.
+# The product of a linked project is its <project-dir>; bin/fm-brief.sh names it,
+# its root, and the home's other projects of the same product in worker briefs.
+# Seed rollback removes only a resolved repository directory that seed itself
+# cloned, plus the projects/<project> link; it never removes code/ itself, a
+# group directory, the project root, README.md, docs/, data/, or sibling
+# repositories.
 #
 # Callers source bin/fm-secondmate-registry-lib.sh and
 # bin/fm-secondmate-parent-lib.sh first; this file reads registries and parent
@@ -339,12 +347,43 @@ $(fm_lp_known_homes "$active")
 EOF
 }
 
+# Succeed when <rel>, a target path relative to the link root, is exactly
+# <project-dir>/code/<repo> or <project-dir>/code/<group>/<repo>.
+fm_lp_shape_valid() {
+  local rel=$1 pdir rest
+  case "$rel" in
+    ''|/*|*/|*//*|*/*/*/*/*) return 1 ;;
+  esac
+  pdir=${rel%%/*}
+  rest=${rel#"$pdir"/}
+  case "$rest" in
+    code/*) rest=${rest#code/} ;;
+    *) return 1 ;;
+  esac
+  case "/$pdir/$rest/" in
+    */./*|*/../*) return 1 ;;
+  esac
+  [ -n "$pdir" ] && [ -n "$rest" ]
+}
+
+# Print the product of a linked target: the <project-dir> it sits under inside
+# <link-root>. Both arguments are resolved paths.
+fm_lp_product_dir() {
+  local root=$1 target=$2 rel
+  case "$target" in
+    "$root"/*) rel=${target#"$root"/} ;;
+    *) return 1 ;;
+  esac
+  fm_lp_shape_valid "$rel" || return 1
+  printf '%s\n' "${rel%%/*}"
+}
+
 # Validate a linked target for <project> in <self-home> and print its resolved
 # path. Arguments: <active-home> <firstmate-code-root> <self-home> <link-root>
 # <project> <target>. Every refusal names the rule it enforces.
 fm_lp_check_target() {
   local active=$1 fm_root=$2 self_in=$3 root_in=$4 project=$5 target_in=$6
-  local self root target rel pdir mid repo label path protected name other
+  local self root target rel label path protected name other
   case "$target_in" in
     /*) ;;
     *) echo "error: linked project $project target must be an absolute path: $target_in" >&2; return 1 ;;
@@ -359,15 +398,8 @@ fm_lp_check_target() {
       return 1
       ;;
   esac
-  pdir=${rel%%/*}
-  mid=${rel#*/}
-  repo=${mid#*/}
-  mid=${mid%%/*}
-  case "$rel" in
-    */*/*/*|*//*|/*|*/) pdir= ;;
-  esac
-  if [ -z "$pdir" ] || [ "$mid" != code ] || [ -z "$repo" ] || [ "$rel" != "$pdir/code/$repo" ]; then
-    echo "error: linked project $project target $target must have the shape $root/<project-dir>/code/<repo>" >&2
+  if ! fm_lp_shape_valid "$rel"; then
+    echo "error: linked project $project target $target must have the shape $root/<project-dir>/code/<repo> or $root/<project-dir>/code/<group>/<repo>" >&2
     return 1
   fi
   protected=$(fm_lp_protected_paths "$active" "$fm_root" "$self") || {
@@ -395,5 +427,13 @@ EOF
 $FM_LP_ENTRIES
 EOF
   fi
+  case "$rel" in
+    */*/*/*)
+      if [ -e "$(dirname "$target")/.git" ]; then
+        echo "error: linked project $project target $target is inside the git repository $(dirname "$target"); a group directory must not be a repository" >&2
+        return 1
+      fi
+      ;;
+  esac
   printf '%s\n' "$target"
 }
