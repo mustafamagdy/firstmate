@@ -93,6 +93,38 @@ fm_lp_canonical() {
   printf '%s\n' "$out"
 }
 
+# Set FM_LP_CANON to the canonical form of <path> without a subshell when every
+# component already exists and none is a symlink, ".", "..", or empty, so a
+# caller comparing against many recorded targets does not fork per target;
+# any other path takes fm_lp_canonical. Fails only when fm_lp_canonical fails.
+fm_lp_canonical_var() {
+  local path=$1 rest probe component
+  FM_LP_CANON=
+  case "$path" in
+    /) ;;
+    /*)
+      case "$path/" in
+        *//*|*/./*|*/../*) ;;
+        *)
+          rest=${path#/}
+          probe=
+          while [ -n "$rest" ]; do
+            component=${rest%%/*}
+            if [ "$component" = "$rest" ]; then rest=; else rest=${rest#*/}; fi
+            probe="$probe/$component"
+            [ -e "$probe" ] && [ ! -L "$probe" ] || { probe=; break; }
+          done
+          if [ -n "$probe" ]; then
+            FM_LP_CANON=$probe
+            return 0
+          fi
+          ;;
+      esac
+      ;;
+  esac
+  FM_LP_CANON=$(fm_lp_canonical "$path") || return 1
+}
+
 # Resolve where a symlink points without requiring its target to exist, so a
 # dangling or retargeted link still reports the path it would redirect to.
 fm_lp_link_target() {
@@ -331,9 +363,24 @@ $next
 
 # Print "<label>\t<path>" for every path a linked target of <self-home> must not
 # overlap: the firstmate code root, each reachable home and the self home, and
-# every linked target of any other reachable home.
+# every linked target of any other reachable home. Within one process that
+# holds the secondmate registry lock, fm_lp_protected_cache_load computes this
+# once for a self home so checking many targets does not rescan every home.
+FM_LP_PROTECTED_CACHE=
+FM_LP_PROTECTED_CACHE_KEY=
+fm_lp_protected_cache_load() {  # <active-home> <firstmate-code-root> <self-home>
+  local self
+  self=$(fm_lp_canonical "$3") || return 1
+  FM_LP_PROTECTED_CACHE=$(fm_lp_protected_paths "$1" "$2" "$self") || return 1
+  FM_LP_PROTECTED_CACHE_KEY="$1|$2|$self"
+}
+
 fm_lp_protected_paths() {
   local active=$1 fm_root=$2 self=$3 home entry dest name target
+  if [ -n "$FM_LP_PROTECTED_CACHE_KEY" ] && [ "$FM_LP_PROTECTED_CACHE_KEY" = "$active|$fm_root|$self" ]; then
+    printf '%s\n' "$FM_LP_PROTECTED_CACHE"
+    return 0
+  fi
   printf 'the firstmate code root\t%s\n' "$(fm_lp_canonical "$fm_root")"
   printf 'the secondmate home itself\t%s\n' "$self"
   while IFS= read -r home; do
@@ -430,7 +477,8 @@ EOF
     while IFS='	' read -r name other; do
       [ -n "$name" ] || continue
       [ "$name" != "$project" ] || continue
-      if fm_lp_overlaps "$target" "$(fm_lp_canonical "$other")"; then
+      fm_lp_canonical_var "$other" || FM_LP_CANON=$other
+      if fm_lp_overlaps "$target" "$FM_LP_CANON"; then
         echo "error: linked project $project target $target is already linked as project $name in $self" >&2
         return 1
       fi

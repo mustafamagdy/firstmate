@@ -2,7 +2,8 @@
 # Provision and route persistent secondmate homes.
 #
 # Usage:
-#   fm-home-seed.sh <id> <home|-> [--link-root <dir>] {<project>[=<repo-path>]...|--no-projects}
+#   fm-home-seed.sh <id> <home|-> [--link-root <dir>] [--mode <no-mistakes|direct-PR> [--yolo]]
+#                   {<project>[=<repo-path>]...|--no-projects}
 #       Provision <home> as an isolated firstmate home. If <home> is "-", acquire
 #       a fresh firstmate worktree via "treehouse get --lease", which durably
 #       leases the worktree under the secondmate <id> so the home survives with
@@ -28,10 +29,24 @@
 #       or, with one optional group level, <link-root>/<project-dir>/code/<group>/<repo>.
 #       --link-root names the home's one link root, an absolute org directory;
 #       a home that already declares one keeps it, and a different value is
-#       refused. A missing target is cloned only when its parent, code/ or
-#       code/<group>/, already exists (the project root, code/, a group
-#       directory, README.md, docs/, and data/ are never created); an existing
-#       one is adopted only when its origin matches, as for existing clones.
+#       refused. A linked project needs no clone or registry entry in the
+#       active home. When the active home has a clone of it, that clone names
+#       the origin: an existing target is adopted only when its origin matches,
+#       and a missing one is cloned from it. Otherwise an existing target that
+#       is the root of a git repository with an origin is adopted with its own
+#       origin, and a missing one is refused for lack of an origin. A missing
+#       target is cloned only when its parent, code/ or code/<group>/, already
+#       exists (the project root, code/, a group directory, README.md, docs/,
+#       and data/ are never created).
+#       A linked project's posture is the active home's registry row when it
+#       has one, else the secondmate home's existing row, else --mode (with
+#       --yolo for merge authority); with none of them the seed refuses, and
+#       local-only is refused from every source. A --mode row is written as
+#       "- <project> [<mode>[ +yolo][ forge=azure-devops]] - linked project
+#       (added <date>)", bound to forge=azure-devops when bin/fm-forge-detect.sh
+#       finds the target's origin on Azure DevOps (direct-PR only); any other
+#       proposed forge is refused until the active home registers the project.
+#       --mode and --yolo never apply to unlinked projects.
 #       bin/fm-linked-projects-lib.sh owns the manifest, the containment rules,
 #       and the cleanup scope; rollback reruns those checks and removes only a
 #       target this seed cloned plus the link it created.
@@ -66,7 +81,7 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-linked-projects-lib.sh"
 
 usage() {
-  echo "usage: fm-home-seed.sh <id> <home|-> [--link-root <dir>] {<project>[=<repo-path>]...|--no-projects}" >&2
+  echo "usage: fm-home-seed.sh <id> <home|-> [--link-root <dir>] [--mode <no-mistakes|direct-PR> [--yolo]] {<project>[=<repo-path>]...|--no-projects}" >&2
   echo "       fm-home-seed.sh validate" >&2
 }
 
@@ -568,14 +583,7 @@ link_project() {
     return 1
   fi
   target=$(check_linked_target "$home" "$project" "$spec") || return 1
-  mode_line=$(registered_posture_line "$project") || return 1
-  read -r mode _ <<EOF
-$mode_line
-EOF
-  if [ "$mode" = local-only ]; then
-    echo "error: project $project is local-only; secondmate routes support only no-mistakes and direct-PR projects" >&2
-    return 1
-  fi
+  mode=$(linked_project_mode "$home" "$project") || return 1
   if [ -L "$link" ]; then
     current=$(fm_lp_link_target "$link") || current=
     if [ "$current" != "$target" ]; then
@@ -586,7 +594,12 @@ EOF
     echo "error: seeded project $project exists at $link and is not a link to $target" >&2
     return 1
   fi
-  url=$(source_origin_url "$project" "$mode" "$src") || return 1
+  # The active home's clone, when it has one, names the project's origin;
+  # otherwise an existing target is adopted with its own origin.
+  url=
+  if [ -e "$src" ] || [ -L "$src" ]; then
+    url=$(source_origin_url "$project" "$mode" "$src") || return 1
+  fi
   if [ -e "$target" ] || [ -L "$target" ]; then
     if [ ! -d "$target" ] || [ -L "$target" ]; then
       echo "error: linked project $project target $target exists but is not a directory" >&2
@@ -597,12 +610,21 @@ EOF
       echo "error: linked project $project target $target is not the root of a git repository" >&2
       return 1
     fi
-    dst_url=$(seeded_origin_url "$project" "$target" "$url") || return 1
-    if [ "$dst_url" != "$url" ]; then
-      echo "error: linked project $project at $target has origin $dst_url; expected $url" >&2
+    if [ -n "$url" ]; then
+      dst_url=$(seeded_origin_url "$project" "$target" "$url") || return 1
+      if [ "$dst_url" != "$url" ]; then
+        echo "error: linked project $project at $target has origin $dst_url; expected $url" >&2
+        return 1
+      fi
+    elif [ -z "$(git -C "$target" remote get-url origin 2>/dev/null || true)" ]; then
+      echo "error: linked project $project at $target has no origin remote, and the active home has no clone at $src to take one from" >&2
       return 1
     fi
   else
+    if [ -z "$url" ]; then
+      echo "error: linked project $project target $target does not exist and there is no origin to clone it from: the active home has no clone at $src; clone the repository into $target first, or add the project to the active home" >&2
+      return 1
+    fi
     if [ ! -d "$(dirname "$target")" ]; then
       echo "error: linked project $project needs the existing code folder $(dirname "$target"); seeding never creates a project root, code/, a group directory, docs/, or data/" >&2
       return 1
@@ -610,6 +632,7 @@ EOF
     printf '%s\t%s\t%s\n' "$project" "$link" "$target" >> "$SEED_CREATED_LINKED_FILE"
     git clone --quiet "$url" "$target"
   fi
+  record_linked_registry_row "$home" "$project" "$mode" "$target" || return 1
   if [ ! -L "$link" ]; then
     printf '%s\t%s\n' "$link" "$target" >> "$SEED_CREATED_LINKS_FILE"
     ln -s -- "$target" "$link"
@@ -621,6 +644,72 @@ EOF
   entries="$entries${entries:+
 }$project	$target"
   fm_lp_manifest_write "$home" "$SEED_LINK_ROOT" "$entries"
+}
+
+# Seed-wide posture for linked projects the active home does not register,
+# from --mode and --yolo.
+SEED_MODE=
+SEED_YOLO=0
+SEED_LINKED_ROWS_FILE=
+
+# Print the delivery mode a linked project is seeded with. The active home's
+# registration wins; then a row the secondmate home already holds, so a re-seed
+# keeps the posture it recorded; then --mode. With none of them the seed
+# refuses rather than defaulting. local-only is refused from every source.
+linked_project_mode() {  # <home> <project>
+  local home=$1 project=$2 mode mode_line
+  if registry_line_for_project "$project" >/dev/null; then
+    mode_line=$(registered_posture_line "$project") || return 1
+    read -r mode _ <<EOF
+$mode_line
+EOF
+  elif registry_line_in_file "$home/data/projects.md" "$project" >/dev/null; then
+    mode=$(project_mode_in_home "$home" "$project") || return 1
+  elif [ -n "$SEED_MODE" ]; then
+    mode=$SEED_MODE
+  else
+    echo "error: linked project $project is not registered in $DATA/projects.md; pass --mode no-mistakes or --mode direct-PR to set its delivery posture" >&2
+    return 1
+  fi
+  if [ "$mode" = local-only ]; then
+    echo "error: project $project is local-only; secondmate routes support only no-mistakes and direct-PR projects" >&2
+    return 1
+  fi
+  printf '%s\n' "$mode"
+}
+
+# Record the secondmate registry row for a linked project the active home does
+# not register: the row the secondmate home already holds, or a standard row
+# from --mode, bound to forge=azure-devops when bin/fm-forge-detect.sh finds the
+# target's origin on Azure DevOps. sync_project_registry writes it.
+record_linked_registry_row() {  # <home> <project> <mode> <target>
+  local home=$1 project=$2 mode=$3 target=$4 line detected tokens
+  registry_line_for_project "$project" >/dev/null && return 0
+  if line=$(registry_line_in_file "$home/data/projects.md" "$project"); then
+    printf '%s\t%s\n' "$project" "$line" >> "$SEED_LINKED_ROWS_FILE"
+    return 0
+  fi
+  detected=$("$FM_ROOT/bin/fm-forge-detect.sh" "$target") || {
+    echo "error: cannot detect the forge of linked project $project at $target" >&2
+    return 1
+  }
+  tokens=$mode
+  [ "$SEED_YOLO" -eq 0 ] || tokens="$tokens +yolo"
+  case "$detected" in
+    forge=none) ;;
+    forge=azure-devops*)
+      if [ "$mode" != direct-PR ]; then
+        echo "error: linked project $project at $target has an Azure DevOps origin, which supports only direct-PR; pass --mode direct-PR" >&2
+        return 1
+      fi
+      tokens="$tokens forge=azure-devops"
+      ;;
+    *)
+      echo "error: linked project $project at $target suggests ${detected%% *} ($detected); register it in $DATA/projects.md with its confirmed forge binding before seeding" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\t- %s [%s] - linked project (added %s)\n' "$project" "$project" "$tokens" "$(date +%F)" >> "$SEED_LINKED_ROWS_FILE"
 }
 
 # Resolve the home's link root from --link-root and any manifest the home
@@ -662,6 +751,14 @@ resolve_seed_link_root() {  # <home> <requested-link-root>
 validate_seed_project() {
   local project=$1 src mode url mode_line
   src="$PROJECTS/$project"
+  # A linked project the active home has no clone of is adopted from its
+  # target, and link_project resolves every linked project's posture.
+  if seed_link_spec_for "$project" >/dev/null; then
+    [ -e "$src" ] || [ -L "$src" ] || return 0
+    git -C "$src" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "error: project $project is not a git repo" >&2; return 1; }
+    [ -n "$(git -C "$src" remote get-url origin 2>/dev/null || true)" ] || { echo "error: project $project has no origin remote at $src" >&2; return 1; }
+    return 0
+  fi
   [ -d "$src" ] || { echo "error: project $project not found at $src" >&2; return 1; }
   git -C "$src" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "error: project $project is not a git repo" >&2; return 1; }
   mode_line=$(registered_posture_line "$project") || return 1
@@ -890,14 +987,18 @@ REGISTRY_ROW_IS_AWK='
   }
 '
 
-registry_line_for_project() {
-  local project=$1 line
-  [ -f "$DATA/projects.md" ] || return 1
+registry_line_in_file() {  # <registry-file> <project>
+  local file=$1 project=$2 line
+  [ -f "$file" ] || return 1
   line=$(awk -v n="$project" "$REGISTRY_ROW_IS_AWK"'
     row_is(n) { print; exit }
-  ' "$DATA/projects.md")
+  ' "$file")
   [ -n "$line" ] || return 1
   printf '%s\n' "$line"
+}
+
+registry_line_for_project() {
+  registry_line_in_file "$DATA/projects.md" "$1"
 }
 
 project_mode_in_home() {
@@ -929,6 +1030,9 @@ sync_project_registry() {
   today=$(date +%F)
   for project in "$@"; do
     line=$(registry_line_for_project "$project" || true)
+    if [ -z "$line" ] && [ -s "$SEED_LINKED_ROWS_FILE" ]; then
+      line=$(awk -F '\t' -v p="$project" '$1 == p { sub(/^[^\t]*\t/, ""); row = $0 } END { if (row != "") print row }' "$SEED_LINKED_ROWS_FILE")
+    fi
     if [ -z "$line" ]; then
       line="- $project - cloned project (added $today)"
     fi
@@ -1061,6 +1165,13 @@ seed_home() {
         shift
         ;;
       --link-root=*) requested_link_root=${arg#--link-root=} ;;
+      --mode)
+        [ $# -gt 0 ] || { echo "error: --mode needs no-mistakes or direct-PR" >&2; return 1; }
+        SEED_MODE=$1
+        shift
+        ;;
+      --mode=*) SEED_MODE=${arg#--mode=} ;;
+      --yolo) SEED_YOLO=1 ;;
       *=*)
         name=${arg%%=*}
         spec=${arg#*=}
@@ -1085,6 +1196,22 @@ seed_home() {
   done
   if [ -n "$requested_link_root" ] && [ "$no_projects" -eq 1 ]; then
     echo "error: --link-root cannot be combined with --no-projects" >&2
+    return 1
+  fi
+  case "$SEED_MODE" in
+    ''|no-mistakes|direct-PR) ;;
+    local-only)
+      echo "error: --mode local-only is refused; secondmate routes support only no-mistakes and direct-PR projects" >&2
+      return 1
+      ;;
+    *) echo "error: --mode must be no-mistakes or direct-PR, not $SEED_MODE" >&2; return 1 ;;
+  esac
+  if [ "$SEED_YOLO" -eq 1 ] && [ -z "$SEED_MODE" ]; then
+    echo "error: --yolo applies only with --mode" >&2
+    return 1
+  fi
+  if [ -n "$SEED_MODE" ] && [ -z "$SEED_LINK_SPECS" ]; then
+    echo "error: --mode applies only to linked projects (<project>=<repo-path>)" >&2
     return 1
   fi
   if [ "${#filtered[@]}" -gt 0 ]; then
@@ -1123,6 +1250,8 @@ seed_home() {
   : > "$SEED_CREATED_LINKED_FILE"
   SEED_CREATED_LINKS_FILE="$SEED_BACKUP_DIR/created-links"
   : > "$SEED_CREATED_LINKS_FILE"
+  SEED_LINKED_ROWS_FILE="$SEED_BACKUP_DIR/linked-rows"
+  : > "$SEED_LINKED_ROWS_FILE"
   SEED_LINK_ROOT=
   SEED_LINK_MANIFEST_EXISTED=0
   SEED_PARENT_REG_EXISTED=0
@@ -1185,6 +1314,12 @@ seed_home() {
   fi
   SEED_HOME_BACKED_UP=1
   resolve_seed_link_root "$home" "$requested_link_root" || return 1
+  if [ -n "$SEED_LINK_SPECS" ]; then
+    fm_lp_protected_cache_load "$FM_HOME" "$FM_ROOT" "$home" || {
+      echo "error: cannot determine the firstmate homes linked projects must avoid" >&2
+      return 1
+    }
+  fi
 
   if [ ! -f "$SEED_PARENT_BRIEF" ]; then
     [ -n "${FM_SECONDMATE_CHARTER:-}" ] || {

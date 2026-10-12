@@ -63,11 +63,13 @@ Preserve the generated charter sections unless the domain genuinely needs a hard
 Provision a local persistent home and registry entry after the charter is filled:
 
 ```sh
-bin/fm-home-seed.sh <id> <home|-> [--link-root <org-dir>] {<project>[=<repo-path>]...|--no-projects}
+bin/fm-home-seed.sh <id> <home|-> [--link-root <org-dir>] [--mode <no-mistakes|direct-PR> [--yolo]] {<project>[=<repo-path>]...|--no-projects}
 ```
 
 A `<project>=<repo-path>` spec links a local home's project to a repository that stays in the captain's workspace layout, `<org-dir>/<project-dir>/code/<repo>` or, for a product whose repositories are grouped, `<org-dir>/<project-dir>/code/<group>/<repo>`, instead of cloning it into the home.
 Use it when the captain wants that secondmate to work in the org's own project repositories; [`docs/configuration.md`](../../../docs/configuration.md#linked-projects-configlinked-projects) owns the contract, including which folders cleanup may never remove.
+An existing repository there is adopted with its own origin even when this home has no clone or registry entry for it, so keep this home's `projects/` empty for such a domain.
+For a linked project this home does not register, pass the captain's posture as `--mode <no-mistakes|direct-PR>` (with `--yolo` only on the captain's word); the seed refuses rather than guessing one.
 
 Provision a whole remote home through its configured SSH host with:
 
