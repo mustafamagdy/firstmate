@@ -6,10 +6,10 @@
 # head is that named head and is already stored on the forge.
 # The watcher check source is byte-for-byte bin/fm-pr-poll.sh; task and PR data
 # live only in a private sidecar and are never interpolated into shell source.
-# A GitHub pull request URL, a GitLab merge request URL, and a Gerrit change URL
-# are all accepted, including a merge request or change on a self-hosted
-# instance.
-# A GitHub pull request the forge reports as a draft is refused, naming the draft
+# A GitHub pull request URL, a GitLab merge request URL, a Gerrit change URL,
+# and an Azure DevOps pull request URL are all accepted, including a merge
+# request or change on a self-hosted instance.
+# A GitHub or Azure DevOps pull request the forge reports as a draft is refused, naming the draft
 # state and recording and arming nothing: a draft cannot be merged, so a poll armed on it
 # would wait for an event that cannot occur while nobody is asked to act.
 # Mark the pull request ready for review, then arm again; a lane that keeps a
@@ -89,6 +89,14 @@ if [ "$PROVIDER" = gitlab ] && ! command -v glab >/dev/null 2>&1; then
   echo "error: watching a GitLab merge request requires glab on PATH" >&2
   exit 1
 fi
+# An Azure DevOps watch needs az, its azure-devops extension, and jq for the
+# same reason, and a sign-in that works: the poll stays silent on a failed
+# sign-in too, so the draft read below refuses on an authentication failure
+# rather than arming a watch that can never read the pull request.
+if [ "$PROVIDER" = azure-devops ] && ! AZURE_MISSING=$(fm_pr_azure_missing); then
+  echo "error: watching an Azure DevOps pull request requires $AZURE_MISSING on PATH" >&2
+  exit 1
+fi
 if [ "$PROVIDER" = gerrit ]; then
   if ! command -v gerrit-axi >/dev/null 2>&1; then
     echo "error: watching a Gerrit change requires gerrit-axi on PATH" >&2
@@ -110,12 +118,30 @@ if [ "$PROVIDER" = github ] && [ "${FM_PR_CHECK_MERGE:-}" != 1 ] && command -v g
   fi
 fi
 
+# The Azure DevOps read is the exact-identity read every Azure DevOps consumer
+# uses, so a URL whose pull request id belongs to another repository is refused
+# here rather than armed as a watch that never matches. As on GitHub, any other
+# unreadable answer does not block arming.
+if [ "$PROVIDER" = azure-devops ] && [ "${FM_PR_CHECK_MERGE:-}" != 1 ]; then
+  if fm_pr_azure_read_pr "$HOST" "$PROJECT_PATH" "$NUMBER"; then
+    if [ "$(printf '%s' "$FM_PR_AZURE_PR_JSON" | jq -r 'if (.isDraft | type) == "boolean" then (.isDraft | tostring) else "" end' 2>/dev/null)" = true ]; then
+      echo "error: $URL is a draft pull request; a draft cannot be merged, so merge monitoring would wait for an event that cannot occur - publish it with az repos pr update --draft false and arm again, or declare a wait instead of done if the draft is deliberate" >&2
+      exit 1
+    fi
+  elif [ "$FM_PR_AZURE_AUTH_FAILED" = true ] || [ -n "$FM_PR_AZURE_OUT" ]; then
+    # A failed sign-in, or an answer that is not this repository's pull request.
+    echo "error: cannot watch $URL: $FM_PR_AZURE_ERROR" >&2
+    exit 1
+  fi
+fi
+
 "$FM_ROOT/bin/fm-guard.sh" || true
 
 # pr_head is recorded only when the forge's CLI can supply it. gh exposes the
 # head commit as a selectable field; plain glab exposes it only inside its JSON
 # output, which would need a JSON processor firstmate does not require, so a
-# GitLab task records no pr_head, and neither does a Gerrit task: a Gerrit
+# GitLab task records no pr_head, nor does an Azure DevOps task, whose merge
+# path reads the head live exactly as GitLab's does, and neither does a Gerrit task: a Gerrit
 # revision names one patch set, every amend or rebase is a new patch set, and
 # bin/fm-review-diff.sh has no Gerrit path to resolve a current head with, so a
 # recorded revision would silently become the reviewed content. Both consumers

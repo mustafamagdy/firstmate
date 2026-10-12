@@ -14,7 +14,7 @@
 # charters still use a single `{TASK}` charter fill. Firstmate may adjust other
 # sections when the task genuinely deviates (e.g. working an existing external
 # PR instead of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--branch-prefix <prefix>] [--base-branch <branch>] [--forge <none|gerrit> [--shape squash]] [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--branch-prefix <prefix>] [--base-branch <branch>] [--forge <none|gerrit|azure-devops> [--shape squash]] [--herdr-lab]
 #        fm-brief.sh <task-id> <repo-name> --scout [--base-branch <branch>] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
@@ -42,7 +42,7 @@
 # resolves it per task at intake (AGENTS.md section 7); data/projects.md holds the
 # captain's standing posture as context, and this script never reads it:
 #   no-mistakes  implement -> /no-mistakes pipeline -> PR -> configured merge authority
-#   direct-PR    implement -> push + open PR via gh-axi (no pipeline) -> configured merge authority
+#   direct-PR    implement -> push + open PR via gh-axi, or az repos pr create on forge=azure-devops (no pipeline) -> configured merge authority
 #   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
 #                the configured merge authority approves, firstmate merges to local main
 # no-mistakes-prod-only is a registry policy, not a task mode; resolve it to one of
@@ -73,8 +73,9 @@
 # script never infers a forge and never looks the binding up, and bin/fm-spawn.sh
 # refuses a brief whose forge disagrees with the registry. bin/fm-project-mode.sh's
 # header owns what the binding means, and bin/fm-dod-lib.sh owns what `gerrit`
-# changes for the worker. A forge on --mode local-only is refused, because that
-# mode publishes nothing.
+# and `azure-devops` change for the worker. A forge on --mode local-only is
+# refused, because that mode publishes nothing, and `azure-devops` composes only
+# with --mode direct-PR.
 # --shape names how a forge=gerrit task is published, and only `squash` - one
 # change - is accepted: `stack` is refused until a stack can be watched by its
 # membership pinned when its watch is armed, because the merge watch follows one
@@ -82,7 +83,7 @@
 # It defaults to squash on gerrit and is refused without it.
 # The generated ship brief records the chosen mode as a fixed machine-readable
 # "Delivery contract: mode=<mode>" line, followed by " forge=gerrit shape=squash"
-# on that forge. bin/fm-spawn.sh reads that line and refuses to launch a ship task
+# or " forge=azure-devops" on those forges. bin/fm-spawn.sh reads that line and refuses to launch a ship task
 # whose explicit --mode or registered forge disagrees, so an adjusted brief and the
 # recorded task metadata cannot drift apart.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
@@ -725,6 +726,8 @@ EOF
 append_brief_include
 if [ "$FORGE" = none ]; then
   echo "scaffolded: $BRIEF (ship, mode=$MODE; replace {TASK} and {FIRSTMATE_SPEC})"
+elif [ "$FORGE" != gerrit ]; then
+  echo "scaffolded: $BRIEF (ship, mode=$MODE forge=$FORGE; replace {TASK} and {FIRSTMATE_SPEC})"
 else
   echo "scaffolded: $BRIEF (ship, mode=$MODE forge=$FORGE shape=$SHAPE; replace {TASK} and {FIRSTMATE_SPEC})"
 fi

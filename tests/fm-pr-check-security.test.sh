@@ -328,6 +328,43 @@ INVALID_URLS=(
   'https://gitlab.com/single/-/merge_requests/1'
   'https://gitlab.com/g/p/-/merge_requests/0'
   'https://gitlab.com/g/p/-/merge_requests/01'
+  'https://dev.azure.com/org/proj/_git/repo/pullrequest/0'
+  'https://dev.azure.com/org/proj/_git/repo/pullrequest/01'
+  'https://dev.azure.com/org/proj/_git/repo/pullrequest/7/'
+  'https://dev.azure.com/org/proj/_git/repo/pullrequest/7?_a=files'
+  'https://dev.azure.com/org/proj/_git/repo/pullrequest/7#discussion'
+  'https://dev.azure.com/org/proj/_git/repo/pullrequest/7 '
+  'https://dev.azure.com/org/proj/_git/repo/pullrequests/7'
+  'https://dev.azure.com/org/proj/_GIT/repo/pullrequest/7'
+  'https://dev.azure.com/org/proj/repo/pullrequest/7'
+  'https://dev.azure.com/org/_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/proj/_git/a/b/pullrequest/7'
+  'https://dev.azure.com/org/a/b/_git/repo/pullrequest/7'
+  'https://dev.azure.com/-org/proj/_git/repo/pullrequest/7'
+  'https://dev.azure.com/o_rg/proj/_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/_proj/_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/proj./_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/proj/_git/.repo/pullrequest/7'
+  'https://dev.azure.com/org/proj/_git/-repo/pullrequest/7'
+  'https://dev.azure.com/org/proj%2Fx/_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/%20proj/_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/proj%20/_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/proj+x/_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/proj x/_git/repo/pullrequest/7'
+  'https://Dev.Azure.com/org/proj/_git/repo/pullrequest/7'
+  'https://dev.azure.com:443/org/proj/_git/repo/pullrequest/7'
+  'https://org@dev.azure.com/org/proj/_git/repo/pullrequest/7'
+  'http://dev.azure.com/org/proj/_git/repo/pullrequest/7'
+  'https://dev.azure.com.evil/org/proj/_git/repo/pullrequest/7'
+  'https://azure.example/org/proj/_git/repo/pullrequest/7'
+  'https://dev.azure.com/org/proj/-/merge_requests/7'
+  'https://dev.azure.com/c/proj/+/7'
+  'https://Org.visualstudio.com/proj/_git/repo/pullrequest/7'
+  'https://a.b.visualstudio.com/proj/_git/repo/pullrequest/7'
+  'https://visualstudio.com/proj/_git/repo/pullrequest/7'
+  'https://org.visualstudio.com/DefaultCollection/proj/_git/repo/pullrequest/7'
+  'https://org.visualstudio.com/group/proj/-/merge_requests/7'
+  'https://org.visualstudio.com/c/proj/+/7'
   'https://GitLab.com/g/p/-/merge_requests/1'
   'https://gitlab.com:443/g/p/-/merge_requests/1'
   'https://user@gitlab.com/g/p/-/merge_requests/1'
@@ -474,7 +511,7 @@ UNSAFE_LIFECYCLE_IDS=(
 )
 
 test_parser_matrix() {
-  local id row url owner repo number
+  local id row url owner repo number host path org_url project
   while IFS='|' read -r url owner repo number; do
     [ -n "$url" ] || continue
     fm_pr_url_parse "$url" || fail "parser rejected canonical URL"
@@ -520,6 +557,27 @@ https://review.internal/c/group/apps/console/+/4201|review.internal|group/apps/c
 https://gerrit.example/c/proj/+/1|gerrit.example|proj|1
 https://gerrit.example.co.uk/c/a/b/c/d/+/42|gerrit.example.co.uk|a/b/c/d|42
 https://review.internal/c/All-Projects/+/123456|review.internal|All-Projects|123456
+EOF
+  # An Azure DevOps path keeps the URL's own spelling, and the organization URL
+  # every az call is pinned to and the decoded names come from it.
+  while IFS='|' read -r url host path number org_url project repo; do
+    [ -n "$url" ] || continue
+    fm_pr_url_parse "$url" || fail "parser rejected a canonical Azure DevOps pull request URL: $url"
+    [ "$FM_PR_PROVIDER" = azure-devops ] || fail "parser did not tag an Azure DevOps URL as azure-devops"
+    [ "$FM_PR_URL" = "$url" ] || fail "parser changed a canonical Azure DevOps URL"
+    [ "$FM_PR_HOST" = "$host" ] || fail "parser returned wrong Azure DevOps host"
+    [ "$FM_PR_PATH" = "$path" ] || fail "parser returned wrong Azure DevOps path"
+    [ "$FM_PR_NUMBER" = "$number" ] || fail "parser returned wrong Azure DevOps pull request id"
+    [ -z "$FM_PR_OWNER" ] && [ -z "$FM_PR_REPO" ] \
+      || fail "parser set GitHub owner/repository for an Azure DevOps URL"
+    fm_pr_azure_identity "$FM_PR_HOST" "$FM_PR_PATH" || fail "Azure DevOps identity did not derive"
+    [ "$FM_PR_AZURE_ORG_URL" = "$org_url" ] || fail "wrong Azure DevOps organization URL: $FM_PR_AZURE_ORG_URL"
+    [ "$FM_PR_AZURE_PROJECT" = "$project" ] || fail "wrong Azure DevOps project: $FM_PR_AZURE_PROJECT"
+    [ "$FM_PR_AZURE_REPO" = "$repo" ] || fail "wrong Azure DevOps repository: $FM_PR_AZURE_REPO"
+  done <<'EOF'
+https://dev.azure.com/match-best/xelta-v2/_git/api/pullrequest/7|dev.azure.com|match-best/xelta-v2/_git/api|7|https://dev.azure.com/match-best|xelta-v2|api
+https://dev.azure.com/Org1/My%20Big%20Project/_git/web.app_1/pullrequest/123456|dev.azure.com|Org1/My%20Big%20Project/_git/web.app_1|123456|https://dev.azure.com/Org1|My Big Project|web.app_1
+https://contoso.visualstudio.com/Proj/_git/repo/pullrequest/12|contoso.visualstudio.com|Proj/_git/repo|12|https://contoso.visualstudio.com|Proj|repo
 EOF
   fm_pr_url_parse https://github.com/a/b/pull/1 || fail "parser rejected canonical URL"
   [ "$FM_PR_PROVIDER" = github ] || fail "parser did not tag a pull request URL as github"
@@ -2083,6 +2141,117 @@ EOF
   pass "GitLab merge requests are followed on any instance and never wake falsely"
 }
 
+test_azure_devops_merge_watch() {
+  local dir state out rc url noaz
+  dir=$(make_case azure-merge-watch)
+  state="$dir/home/state"
+  url='https://dev.azure.com/match-best/Xelta%20V2/_git/api/pullrequest/7'
+  fm_fake_az "$dir/fakebin"
+  ln -sf "$REAL_JQ" "$dir/fakebin/jq"
+  : > "$dir/az.log"
+  fm_fake_az_pr_json "$dir/pr.json"
+  export FM_TEST_AZ_DIR="$dir"
+
+  # Arming reads the exact pull request once, then records and arms it.
+  write_task_meta "$dir"
+  run_check_entry "$dir" task-a "$url" > "$dir/stdout" 2> "$dir/stderr" \
+    || fail "arming refused a ready Azure DevOps pull request: $(cat "$dir/stderr")"
+  grep -qxF "pr=$url" "$state/task-a.meta" || fail "the Azure DevOps pull request was not recorded"
+  [ "$(cat "$state/task-a.pr-poll")" = "azure-devops
+$url
+dev.azure.com
+match-best/Xelta%20V2/_git/api
+7" ] || fail "published Azure DevOps sidecar bytes were not exact"
+  grep -qxF 'repos pr show --id 7 --org https://dev.azure.com/match-best --only-show-errors --output json' "$dir/az.log" \
+    || fail "arming did not read the pull request pinned to the URL's organization"
+
+  # Only an exact completed pull request of the stored repository wakes.
+  for value in active abandoned; do
+    fm_fake_az_pr_json "$dir/pr.json" "status=$value"
+    out=$(run_poll "$dir")
+    [ -z "$out" ] || fail "Azure DevOps poll emitted for status $value"
+  done
+  fm_fake_az_pr_json "$dir/pr.json" status=completed
+  out=$(run_poll "$dir")
+  [ "$out" = merged ] || fail "Azure DevOps poll did not emit exactly one merged line"
+  fm_fake_az_pr_json "$dir/pr.json" status=completed repo=other
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "Azure DevOps poll emitted for another repository's pull request"
+  fm_fake_az_pr_json "$dir/pr.json" status=completed id=8
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "Azure DevOps poll emitted for another pull request id"
+  fm_fake_az_pr_json "$dir/pr.json" status=completed
+  : > "$dir/auth-fails"
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "Azure DevOps poll emitted after a failed sign-in"
+  rm -f "$dir/auth-fails"
+
+  # A doctored sidecar cannot redirect the poll.
+  printf '%s\n%s\n%s\n%s\n%s\n' azure-devops "$url" dev.azure.com 'other-org/Xelta%20V2/_git/api' 7 \
+    > "$state/task-a.pr-poll"
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "Azure DevOps poll emitted for a sidecar whose organization was swapped"
+  printf '%s\n%s\n%s\n%s\n%s\n' azure-devops "$url" evil.example 'match-best/Xelta%20V2/_git/api' 7 \
+    > "$state/task-a.pr-poll"
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "Azure DevOps poll emitted for a sidecar whose host was swapped"
+
+  # Arming refuses a draft, a failed sign-in, and another repository's pull
+  # request, recording nothing for any of them.
+  fm_fake_az_pr_json "$dir/pr.json" draft=true
+  write_task_meta "$dir" task-b
+  set +e
+  run_check_entry "$dir" task-b "$url" > /dev/null 2> "$dir/draft.err"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "arming accepted a draft Azure DevOps pull request"
+  grep -qF 'is a draft pull request' "$dir/draft.err" || fail "the draft refusal did not name the draft"
+  [ ! -e "$state/task-b.check.sh" ] || fail "a refused draft armed a poll"
+
+  fm_fake_az_pr_json "$dir/pr.json"
+  : > "$dir/auth-fails"
+  set +e
+  run_check_entry "$dir" task-b "$url" > /dev/null 2> "$dir/auth.err"; rc=$?
+  set -e
+  rm -f "$dir/auth-fails"
+  [ "$rc" -ne 0 ] || fail "arming succeeded without an Azure DevOps sign-in"
+  grep -qF 'Azure DevOps authentication failed for https://dev.azure.com/match-best: sign in with az login, or set AZURE_DEVOPS_EXT_PAT' \
+    "$dir/auth.err" || fail "the sign-in refusal did not name what is missing"
+  [ ! -e "$state/task-b.check.sh" ] || fail "an unauthenticated watch was armed"
+
+  fm_fake_az_pr_json "$dir/pr.json" repo=other
+  set +e
+  run_check_entry "$dir" task-b "$url" > /dev/null 2> "$dir/repo.err"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "arming accepted another repository's pull request"
+  grep -qF 'did not return pull request 7 of repository "api" in project "Xelta V2"' "$dir/repo.err" \
+    || fail "the identity refusal did not name the expected repository"
+  [ ! -e "$state/task-b.check.sh" ] || fail "a mismatched pull request armed a poll"
+
+  # A missing extension or az is named at arming, where it can still be heard.
+  fm_fake_az_pr_json "$dir/pr.json"
+  : > "$dir/no-extension"
+  set +e
+  run_check_entry "$dir" task-b "$url" > /dev/null 2> "$dir/ext.err"; rc=$?
+  set -e
+  rm -f "$dir/no-extension"
+  [ "$rc" -ne 0 ] || fail "arming succeeded without the azure-devops extension"
+  grep -qF 'requires the azure-devops extension for az' "$dir/ext.err" \
+    || fail "the refusal did not name the missing extension"
+  noaz=$(fm_test_base_path_sans "$dir/fakebin:$BASE_PATH" az)
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$dir/root" FM_HOME="$dir/home" FM_TEST_GUARD_LOG="$dir/guard.log" \
+    PATH="$noaz" "$PR_CHECK" task-b "$url" 2>&1); rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "arming succeeded with az absent"
+  case "$out" in
+    *"requires az (the Azure CLI) on PATH"*) ;;
+    *) fail "arming with az absent did not name az: $out" ;;
+  esac
+  [ ! -e "$state/task-b.check.sh" ] || fail "a refused Azure DevOps watch was armed"
+  unset FM_TEST_AZ_DIR
+  pass "Azure DevOps pull requests are armed only when readable and followed without false wakes"
+}
+
 seed_canonical_poll() {
   local dir=$1 id=$2 url=$3 template=${4:-$POLL} state provider host path number
   state="$dir/home/state"
@@ -3441,6 +3610,7 @@ SH
 
 test_parser_matrix
 test_gitlab_merge_watch
+test_azure_devops_merge_watch
 test_gerrit_merge_watch
 test_gerrit_arming_records_no_patch_set_revision
 test_gerrit_ready_gate_reads_the_published_tree

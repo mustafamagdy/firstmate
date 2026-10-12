@@ -96,7 +96,41 @@
 # recorded value stale. Reading that state needs glab and jq, and either one
 # absent stops the merge before any state is recorded.
 #
-# Before either forge merge, the task's existing per-task control lock
+# An Azure DevOps pull request
+# (https://dev.azure.com/<org>/<project>/_git/<repository>/pullrequest/<id>, or
+# the legacy https://<org>.visualstudio.com/... form) is read and completed
+# through plain az with its azure-devops extension, every call pinned with
+# --org to the organization the URL names, so no `az devops configure` default
+# can redirect it. Authentication is the environment's own (`az login`, or
+# AZURE_DEVOPS_EXT_PAT from the organization's .envrc) and is never read,
+# stored, or printed here. A missing az, a missing azure-devops extension, a
+# missing jq, and a failed sign-in each stop the merge with a sentence naming
+# what is missing; the tool checks run before anything is recorded.
+# A merge is refused unless every pre-merge condition holds, each read live at
+# merge time: the read pull request is exactly the URL's (id, repository, and
+# project), it is active, not a draft, its mergeStatus is succeeded (conflicts
+# is reported as a conflict), no reviewer's vote rejects it or waits for its
+# author, and every required policy evaluation is green, where
+# fm_pr_azure_policy_blockers in bin/fm-pr-lib.sh owns what green means: a
+# required policy that is queued, running, or never reported is pending, never
+# passed, and a rejected optional policy refuses too. When a still-computing
+# mergeStatus (queued or notSet) is the only failing condition, every
+# condition is re-read after a short bounded wait instead of refusing.
+# Completion is a PATCH of the pull request through `az devops invoke`,
+# because `az repos pr update --status completed` re-reads the source commit
+# itself and cannot bind the head this run verified: the request carries
+# lastMergeSourceCommit set to that verified head, so a push that lands in
+# between is not completed unverified, and it squashes unless the caller passes
+# --merge (noFastForward) or --rebase. No other extra argument is accepted, and
+# --allow-red and --allow-missing do not apply, because a required policy is
+# enforced by the server as well. Azure DevOps completes asynchronously, so the
+# pull request is then re-read a bounded number of times and a landed outcome is
+# recorded only once it reads completed; a completion that is not proven in that
+# window refuses non-zero, records nothing as landed, and leaves the merge poll
+# armed. A completed pull request whose merged source commit is not the verified
+# head is reported as actionable.
+#
+# Before any forge merge, the task's existing per-task control lock
 # serializes the captain-hold check through the forge command. A still-held or
 # unreadable row refuses before that command, so a captain approval must be
 # recorded as an `answer --release` before this entrypoint is invoked. While
@@ -238,6 +272,10 @@ if [ "${#ALLOW_MISSING[@]}" -gt 0 ] && [ "$PROVIDER" = gitlab ]; then
   echo "error: --allow-missing does not apply to GitLab, where a merge already requires the head pipeline to have succeeded" >&2
   exit 2
 fi
+if [ "$PROVIDER" = azure-devops ] && { [ "${#ALLOW_RED[@]}" -gt 0 ] || [ "${#ALLOW_MISSING[@]}" -gt 0 ]; }; then
+  echo "error: --allow-red and --allow-missing do not apply to Azure DevOps, where the server enforces every required policy at completion" >&2
+  exit 2
+fi
 
 caller_has_merge_method() {
   local arg
@@ -345,6 +383,40 @@ reject_repo_overrides "$@" || exit 1
 reject_head_overrides "$@" || exit 1
 reject_protected_forge_args "$@" || exit 1
 
+# The only extra arguments an Azure DevOps completion takes select its merge
+# strategy, spelled the way caller_merge_method reads them; squash is the
+# default, mirroring the GitHub default.
+AZURE_MERGE_STRATEGY=squash
+azure_merge_strategy_from_args() {
+  local arg pending=false
+  for arg in "$@"; do
+    if [ "$pending" = true ]; then
+      pending=false
+      continue
+    fi
+    case "$arg" in
+      --squash|--merge|--rebase|--method=*) ;;
+      --method) pending=true ;;
+      *)
+        echo "error: extra merge argument $arg is not supported for an Azure DevOps pull request; only --squash, --merge, or --rebase selects the merge strategy" >&2
+        return 1
+        ;;
+    esac
+  done
+  case "$(caller_merge_method "$@")" in
+    ''|squash) AZURE_MERGE_STRATEGY=squash ;;
+    merge) AZURE_MERGE_STRATEGY=noFastForward ;;
+    rebase) AZURE_MERGE_STRATEGY=rebase ;;
+    *)
+      echo "error: unsupported merge method for an Azure DevOps pull request; use --squash, --merge, or --rebase" >&2
+      return 1
+      ;;
+  esac
+}
+if [ "$PROVIDER" = azure-devops ]; then
+  azure_merge_strategy_from_args "$@" || exit 2
+fi
+
 FM_PR_GITHUB_AUTO_REQUESTED=false
 if [ "$PROVIDER" = github ] && caller_requested_auto_merge "$@"; then
   FM_PR_GITHUB_AUTO_REQUESTED=true
@@ -428,6 +500,10 @@ if [ "$PROVIDER" = gitlab ]; then
     exit 1
   fi
 fi
+if [ "$PROVIDER" = azure-devops ] && ! AZURE_MISSING=$(fm_pr_azure_missing); then
+  echo "error: merging an Azure DevOps pull request requires $AZURE_MISSING on PATH" >&2
+  exit 1
+fi
 GITHUB_MISSING=
 if [ "$PROVIDER" = github ]; then
   command -v gh >/dev/null 2>&1 || GITHUB_MISSING="gh"
@@ -443,7 +519,7 @@ fi
 # The recorded head is read before bin/fm-pr-check.sh rewrites the metadata,
 # because that script re-records pr= and drops a pr_head= it cannot resolve.
 RECORDED_HEAD=
-if [ "$PROVIDER" = gitlab ]; then
+if [ "$PROVIDER" = gitlab ] || [ "$PROVIDER" = azure-devops ]; then
   RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
 fi
 
@@ -550,6 +626,208 @@ FIELDS
     "$URL" "$live_head" >&2
   FM_PR_MERGE_HEAD=$live_head
   FM_PR_GITLAB_ASYNC_CONFIGURED=$async_configured
+}
+
+# Pre-merge conditions for an Azure DevOps pull request, read from one live
+# exact-identity read of the pull request and one read of its policy
+# evaluations. Sets FM_PR_MERGE_HEAD and the project and repository ids the
+# completion addresses on success. Returns 1 after reporting every condition
+# that failed, and 3 when a still-computing mergeStatus is the only one, so the
+# caller can re-read after a short wait.
+AZURE_PROJECT_ID=
+AZURE_REPOSITORY_ID=
+azure_verify_mergeable() {
+  local fields line policies policy_lines review_lines kind name status
+  local total=0 named=0 refusals='' pending_merge=false
+  local state='' draft='' merge_status='' live_head='' project_id='' repository_id=''
+  local guid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+  if ! fm_pr_azure_read_pr "$PR_HOST" "$PR_PATH" "$PR_NUMBER"; then
+    echo "error: could not read the Azure DevOps pull request state before merging: $FM_PR_AZURE_ERROR" >&2
+    return 1
+  fi
+  if ! fields=$(printf '%s' "$FM_PR_AZURE_PR_JSON" | jq -r '
+      "state=" + ((.status // "") | tostring),
+      "draft=" + (.isDraft | tostring),
+      "merge_status=" + ((.mergeStatus // "") | tostring),
+      "head=" + ((.lastMergeSourceCommit.commitId // "") | tostring),
+      "project_id=" + ((.repository.project.id // "") | tostring),
+      "repository_id=" + ((.repository.id // "") | tostring)
+    ' 2>/dev/null); then
+    echo "error: could not read the Azure DevOps pull request state before merging" >&2
+    return 1
+  fi
+  while IFS= read -r line; do
+    total=$((total + 1))
+    case "$line" in
+      state=*) state=${line#state=} ;;
+      draft=*) draft=${line#draft=} ;;
+      merge_status=*) merge_status=${line#merge_status=} ;;
+      head=*) live_head=${line#head=} ;;
+      project_id=*) project_id=${line#project_id=} ;;
+      repository_id=*) repository_id=${line#repository_id=} ;;
+      *) continue ;;
+    esac
+    named=$((named + 1))
+  done <<FIELDS
+$fields
+FIELDS
+  # Every field named exactly once and no unnamed line, as on GitLab.
+  if [ "$named" -ne 6 ] || [ "$total" -ne 6 ] \
+    || ! [[ "$project_id" =~ $guid ]] || ! [[ "$repository_id" =~ $guid ]]; then
+    echo "error: could not read the Azure DevOps pull request state before merging" >&2
+    return 1
+  fi
+  if ! fm_pr_head_valid "$live_head"; then
+    echo "error: could not read the Azure DevOps pull request source commit before merging" >&2
+    return 1
+  fi
+  if [ -n "$RECORDED_HEAD" ] && [ "$RECORDED_HEAD" != "$live_head" ]; then
+    printf 'notice: recorded head %s disagrees with the live head %s; verifying the live head\n' \
+      "$RECORDED_HEAD" "$live_head" >&2
+  fi
+
+  if ! fm_pr_azure_run "$FM_PR_AZURE_ORG_URL" repos pr policy list --id "$PR_NUMBER"; then
+    echo "error: could not read the Azure DevOps policy evaluations before merging: $FM_PR_AZURE_ERROR" >&2
+    return 1
+  fi
+  policies=$FM_PR_AZURE_OUT
+  if ! policy_lines=$(fm_pr_azure_policy_blockers "$policies"); then
+    echo "error: could not read the Azure DevOps policy evaluations before merging" >&2
+    return 1
+  fi
+  if ! review_lines=$(fm_pr_azure_review_blockers "$FM_PR_AZURE_PR_JSON"); then
+    echo "error: could not read the Azure DevOps reviewer votes before merging" >&2
+    return 1
+  fi
+
+  [ "$state" = active ] \
+    || refusals="$refusals  - status is \"${state:-unreadable}\", not active
+"
+  [ "$draft" = false ] \
+    || refusals="$refusals  - isDraft is \"${draft:-unreadable}\", not false
+"
+  case "$merge_status" in
+    succeeded) ;;
+    conflicts)
+      refusals="$refusals  - mergeStatus is \"conflicts\": the source branch conflicts with the target branch
+" ;;
+    queued|notSet)
+      pending_merge=true
+      refusals="$refusals  - mergeStatus is \"$merge_status\": Azure DevOps has not finished computing whether it merges
+" ;;
+    *)
+      refusals="$refusals  - mergeStatus is \"${merge_status:-unreadable}\", not succeeded
+" ;;
+  esac
+  while IFS="$(printf '\t')" read -r kind name status; do
+    case "$kind" in
+      red) refusals="$refusals  - required policy \"$name\" is $status
+" ;;
+      pending) refusals="$refusals  - required policy \"$name\" has not passed ($status)
+" ;;
+      red-optional) refusals="$refusals  - optional policy \"$name\" is $status
+" ;;
+    esac
+  done <<POLICIES
+$policy_lines
+POLICIES
+  while IFS="$(printf '\t')" read -r kind name; do
+    case "$kind" in
+      rejected) refusals="$refusals  - reviewer \"$name\" rejected the pull request
+" ;;
+      waiting) refusals="$refusals  - reviewer \"$name\" is waiting for the author
+" ;;
+    esac
+  done <<REVIEWS
+$review_lines
+REVIEWS
+
+  if [ -n "$refusals" ]; then
+    if [ "$pending_merge" = true ] && [ "$(printf '%s' "$refusals" | grep -c '^  - ')" -eq 1 ]; then
+      return 3
+    fi
+    printf 'error: refusing to merge %s\n' "$URL" >&2
+    printf '%s' "$refusals" >&2
+    return 1
+  fi
+  printf 'verified: %s is active and mergeable, with every required policy green at source commit %s\n' \
+    "$URL" "$live_head" >&2
+  FM_PR_MERGE_HEAD=$live_head
+  AZURE_PROJECT_ID=$project_id
+  AZURE_REPOSITORY_ID=$repository_id
+}
+
+# Complete the verified pull request. The PATCH binds lastMergeSourceCommit to
+# the head azure_verify_mergeable verified, so Azure DevOps refuses to complete
+# a source branch that moved after that read.
+azure_complete() {
+  local body rc=0
+  body=$(mktemp "${TMPDIR:-/tmp}/fm-pr-merge-azure.XXXXXX") || {
+    echo "error: could not create the Azure DevOps completion request" >&2
+    return 1
+  }
+  if ! jq -n --arg head "$FM_PR_MERGE_HEAD" --arg strategy "$AZURE_MERGE_STRATEGY" \
+    '{status: "completed", lastMergeSourceCommit: {commitId: $head}, completionOptions: {mergeStrategy: $strategy}}' \
+    > "$body" 2>/dev/null; then
+    rm -f "$body"
+    echo "error: could not create the Azure DevOps completion request" >&2
+    return 1
+  fi
+  fm_pr_azure_run "$FM_PR_AZURE_ORG_URL" devops invoke --area git --resource pullRequests \
+    --route-parameters "project=$AZURE_PROJECT_ID" "repositoryId=$AZURE_REPOSITORY_ID" "pullRequestId=$PR_NUMBER" \
+    --http-method PATCH --in-file "$body" --api-version 7.1 || rc=$?
+  rm -f "$body"
+  if [ "$rc" -ne 0 ]; then
+    echo "error: Azure DevOps refused to complete $URL: $FM_PR_AZURE_ERROR" >&2
+    return 1
+  fi
+}
+
+# Azure DevOps completes a pull request asynchronously, so the accepted request
+# is re-read a bounded number of times, re-checking the exact identity on each
+# read. Returns 0 only when the pull request reads completed. The delay is
+# capped at 0-10 seconds so the wait stays short.
+azure_confirm_completed() {
+  local delay=${FM_PR_AZURE_COMPLETE_RETRY_DELAY:-3} attempt=1 fields state merge_status merged_head
+  case "$delay" in
+    [0-9] | 10) ;;
+    *) delay=3 ;;
+  esac
+  while :; do
+    state=
+    merge_status=
+    merged_head=
+    if fm_pr_azure_read_pr "$PR_HOST" "$PR_PATH" "$PR_NUMBER" \
+      && fields=$(printf '%s' "$FM_PR_AZURE_PR_JSON" | jq -r '
+        ((.status // "") | tostring) + "\t" + ((.mergeStatus // "") | tostring) + "\t"
+          + ((.lastMergeSourceCommit.commitId // "") | tostring)' 2>/dev/null); then
+      IFS="$(printf '\t')" read -r state merge_status merged_head <<FIELDS
+$fields
+FIELDS
+    fi
+    case "$state" in
+      completed)
+        if [ "$merged_head" != "$FM_PR_MERGE_HEAD" ]; then
+          printf 'actionable: %s completed, but Azure DevOps reports merged source commit %s, not the verified head %s\n' \
+            "$URL" "${merged_head:-unreadable}" "$FM_PR_MERGE_HEAD" >&2
+        fi
+        printf 'verified: %s is completed (status=completed, mergeStatus=%s)\n' "$URL" "$merge_status"
+        return 0
+        ;;
+      abandoned)
+        printf 'error: %s was abandoned rather than completed; nothing was merged\n' "$URL" >&2
+        return 1
+        ;;
+    esac
+    if [ "$attempt" -ge 10 ]; then
+      printf 'actionable: Azure DevOps accepted the completion request for %s but has not reported it completed (status=%s, mergeStatus=%s); nothing is recorded as landed and the merge poll remains armed\n' \
+        "$URL" "${state:-unreadable}" "${merge_status:-unreadable}" >&2
+      return 1
+    fi
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
 }
 
 # Every GitHub check that is not green in the given live pull-request JSON, one
@@ -1458,6 +1736,46 @@ case "$PROVIDER" in
     gitlab_confirm_rc=0
     gitlab_confirm_merged || gitlab_confirm_rc=$?
     [ "$gitlab_confirm_rc" -eq 0 ] || exit 0
+    ;;
+  azure-devops)
+    merge_retry_delay=${FM_PR_AZURE_MERGEABLE_RETRY_DELAY:-3}
+    case "$merge_retry_delay" in
+      [0-9] | 10) ;;
+      *) merge_retry_delay=3 ;;
+    esac
+    merge_attempt=1
+    while :; do
+      mergeable_status=0
+      azure_verify_mergeable || mergeable_status=$?
+      if [ "$mergeable_status" -ne 3 ] || [ "$merge_attempt" -ge 5 ]; then
+        break
+      fi
+      sleep "$merge_retry_delay"
+      merge_attempt=$((merge_attempt + 1))
+    done
+    if [ "$mergeable_status" -ne 0 ]; then
+      if [ "$mergeable_status" -eq 3 ]; then
+        printf 'error: whether %s merges is still being computed by Azure DevOps; retry shortly\n' "$URL" >&2
+      fi
+      exit 1
+    fi
+    # The away record is locked first, so this last presence and authority read
+    # and the forge command below share one live-owner critical section.
+    hold_away_record_for_merge || exit 1
+    away_status=0
+    require_current_away_authority || away_status=$?
+    [ "$away_status" -eq 0 ] || exit "$away_status"
+    if ! azure_complete; then
+      fm_afk_contract_lock_release || true
+      fm_lock_release "$MERGE_CONTROL_LOCK" || true
+      MERGE_CONTROL_LOCK=
+      exit 1
+    fi
+    persist_accepted_merge_authority || exit 1
+    fm_afk_contract_lock_release || true
+    fm_lock_release "$MERGE_CONTROL_LOCK" || true
+    MERGE_CONTROL_LOCK=
+    azure_confirm_completed || exit 1
     ;;
   *)
     echo "error: invalid PR merge request" >&2

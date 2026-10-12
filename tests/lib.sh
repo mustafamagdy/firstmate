@@ -549,6 +549,118 @@ SH
   chmod +x "$fakebin/$tool"
 }
 
+# fm_fake_az <fakebin>
+# Drops an offline az stub for the Azure DevOps paths. It never reaches any
+# Azure DevOps organization: every answer comes from files in the directory
+# FM_TEST_AZ_DIR names, and every call is appended to "$FM_TEST_AZ_DIR/az.log".
+#   extension show      exits 1 when "no-extension" exists, else 0
+#   repos pr show       prints "pr.json", or "pr-post.json" once a completion
+#                       was accepted (unless "stays-active" exists)
+#   repos pr policy list prints "policies.json" ("[]" when absent)
+#   devops invoke       copies its --in-file to "invoke-body.json" and accepts
+#                       the completion, unless "invoke-fails" exists
+# "auth-fails" makes every pull-request call fail the way az does without a
+# sign-in, and "show-fails" makes the pull-request read fail generically. Any
+# other call fails with status 91.
+fm_fake_az() {
+  local fakebin=$1
+  cat > "$fakebin/az" <<'SH'
+#!/usr/bin/env bash
+dir=${FM_TEST_AZ_DIR:?FM_TEST_AZ_DIR is required by the fake az}
+printf '%s\n' "$*" >> "$dir/az.log"
+case "${1:-} ${2:-}" in
+  "extension show") [ ! -e "$dir/no-extension" ]; exit ;;
+esac
+if [ -e "$dir/auth-fails" ]; then
+  echo "ERROR: Before you can run Azure DevOps commands, you need to run the login command (az login if using AAD/MSA identity else az devops login if using PAT token) to setup credentials." >&2
+  exit 1
+fi
+case "${1:-} ${2:-} ${3:-} ${4:-}" in
+  "repos pr show "*)
+    [ ! -e "$dir/show-fails" ] || { echo "ERROR: The requested resource does not exist." >&2; exit 1; }
+    if [ -e "$dir/completed" ] && [ ! -e "$dir/stays-active" ] && [ -e "$dir/pr-post.json" ]; then
+      cat "$dir/pr-post.json"
+    else
+      cat "$dir/pr.json"
+    fi
+    ;;
+  "repos pr policy list")
+    if [ -e "$dir/policies.json" ]; then cat "$dir/policies.json"; else echo '[]'; fi
+    ;;
+  "devops invoke "*)
+    prev=
+    for arg in "$@"; do
+      [ "$prev" != --in-file ] || cp "$arg" "$dir/invoke-body.json"
+      prev=$arg
+    done
+    if [ -e "$dir/invoke-fails" ]; then
+      echo "ERROR: TF401181: The pull request cannot be completed because the source branch was updated." >&2
+      exit 1
+    fi
+    : > "$dir/completed"
+    echo '{}'
+    ;;
+  *)
+    printf 'unexpected az call: %s\n' "$*" >&2
+    exit 91
+    ;;
+esac
+SH
+  chmod +x "$fakebin/az"
+}
+
+# fm_fake_az_pr_json <file> [<field>=<value> ...]
+# An Azure DevOps pull-request record as `az repos pr show` prints it, for
+# pull request 7 of repository "api" in project "Xelta V2", that satisfies
+# every pre-merge condition. Named fields override one condition at a time:
+# id, status, draft, merge, head, repo, project, reviewers (a raw JSON array).
+fm_fake_az_pr_json() {
+  local file=$1 kv key value
+  local id=7 status=active draft=false merge=succeeded
+  local head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa repo=api project='Xelta V2' reviewers='[]'
+  shift
+  for kv in "$@"; do
+    key=${kv%%=*}
+    value=${kv#*=}
+    case "$key" in
+      id) id=$value ;;
+      status) status=$value ;;
+      draft) draft=$value ;;
+      merge) merge=$value ;;
+      head) head=$value ;;
+      repo) repo=$value ;;
+      project) project=$value ;;
+      reviewers) reviewers=$value ;;
+      *) fail "fm_fake_az_pr_json: unknown field '$key'" ;;
+    esac
+  done
+  jq -n --argjson id "$id" --arg status "$status" --argjson draft "$draft" \
+    --arg merge "$merge" --arg head "$head" --arg repo "$repo" --arg project "$project" \
+    --argjson reviewers "$reviewers" '{
+      pullRequestId: $id, status: $status, isDraft: $draft, mergeStatus: $merge,
+      closedDate: (if $status == "completed" then "2026-10-12T10:00:00Z" else null end),
+      lastMergeSourceCommit: {commitId: $head},
+      reviewers: $reviewers,
+      repository: {
+        id: "11111111-2222-3333-4444-555555555555", name: $repo,
+        webUrl: ("https://dev.azure.com/match-best/" + ($project | gsub(" "; "%20")) + "/_git/" + $repo),
+        project: {id: "66666666-7777-8888-9999-000000000000", name: $project}
+      }
+    }' > "$file"
+}
+
+# fm_fake_az_policy <name> <status> [blocking] [extra-context-json]
+# One policy evaluation record as `az repos pr policy list` prints it.
+fm_fake_az_policy() {
+  local name=$1 status=$2 blocking=${3:-true} context=${4:-null}
+  jq -cn --arg name "$name" --arg status "$status" --argjson blocking "$blocking" \
+    --argjson context "$context" '{
+      status: $status, context: $context,
+      configuration: {isEnabled: true, isBlocking: $blocking,
+        type: {displayName: "Build"}, settings: {displayName: $name}}
+    }'
+}
+
 # fm_fake_claude_outside_read_gate <fakebin>
 # Drops a claude stub that models the 2.1.257 outside-read gate instead of
 # answering like a generic exit-0 tool: it resolves its own cwd and every

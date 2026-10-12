@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Static watcher program for a validated pull request, merge request, or Gerrit
-# change poll sidecar.
+# Static watcher program for a validated pull request (GitHub or Azure DevOps),
+# merge request, or Gerrit change poll sidecar.
 # It emits exactly one merged line for a merged change and stays silent
 # otherwise, including on every error, so a failed lookup can never be read as
 # a merge. The provider-tagged identity is data in the sidecar and is never
 # interpolated into this source: these bytes are identical for every task.
 # Each provider is read through its own standard CLI, gh for GitHub, glab for
-# GitLab, and gerrit-axi for Gerrit, so an upstream checkout needs no extra
-# tooling to follow the first two. The Gerrit branch additionally needs jq,
-# which bin/fm-pr-check.sh refuses to arm a Gerrit watch without.
+# GitLab, gerrit-axi for Gerrit, and az with its azure-devops extension for
+# Azure DevOps, so an upstream checkout needs no extra tooling to follow the
+# first two. The Gerrit and Azure DevOps branches additionally need jq, which
+# bin/fm-pr-check.sh refuses to arm either watch without.
 set -u
 LC_ALL=C
 export LC_ALL
@@ -73,6 +74,7 @@ case "$provider" in
     [ "$host" != github.com ] || exit 0
     case "$host" in
       .*|*.|*..*|*[!a-z0-9.-]*) exit 0 ;;
+      dev.azure.com|*.dev.azure.com|visualstudio.com|*.visualstudio.com) exit 0 ;;
     esac
     [ "${#path}" -ge 3 ] && [ "${#path}" -le 1024 ] || exit 0
     case "$path" in
@@ -113,6 +115,7 @@ case "$provider" in
     [ "$host" != github.com ] || exit 0
     case "$host" in
       .*|*.|*..*|*[!a-z0-9.-]*) exit 0 ;;
+      dev.azure.com|*.dev.azure.com|visualstudio.com|*.visualstudio.com) exit 0 ;;
     esac
     [ "${#path}" -ge 1 ] && [ "${#path}" -le 1024 ] || exit 0
     case "$path" in
@@ -170,6 +173,61 @@ case "$provider" in
         error("invalid gerrit record")
       end' 2>/dev/null) || exit 0
     [ "$status" = MERGED ] && printf '%s\n' merged
+    ;;
+  azure-devops)
+    # The organization comes from the validated record: the first path segment
+    # on dev.azure.com, or the first host label on a legacy visualstudio.com
+    # host. A project or repository name is one segment of letters, digits,
+    # ".", "_", "-", and %20-encoded spaces, which is decoded for comparison.
+    case "$host" in
+      dev.azure.com)
+        org=${path%%/*}
+        rest=${path#*/}
+        org_url="https://dev.azure.com/$org"
+        case "$org" in *[!A-Za-z0-9-]*) exit 0 ;; esac
+        ;;
+      *.visualstudio.com)
+        org=${host%.visualstudio.com}
+        rest=$path
+        org_url="https://$host"
+        case "$org" in *[!a-z0-9-]*) exit 0 ;; esac
+        ;;
+      *) exit 0 ;;
+    esac
+    [ "${#org}" -ge 1 ] && [ "${#org}" -le 50 ] || exit 0
+    case "$org" in -*|*-) exit 0 ;; esac
+    case "$rest" in
+      */_git/*) project=${rest%%/_git/*}; repo=${rest#*/_git/} ;;
+      *) exit 0 ;;
+    esac
+    for name in "$project" "$repo"; do
+      [ -n "$name" ] || exit 0
+      plain=${name//%20/}
+      case "$plain" in *[!A-Za-z0-9._-]*) exit 0 ;; esac
+      decoded=${name//%20/ }
+      [ "${#decoded}" -le 64 ] || exit 0
+      case "$decoded" in .*|_*|-*|*.|' '*|*' ') exit 0 ;; esac
+    done
+    [ "$url" = "https://$host/$path/pullrequest/$number" ] || exit 0
+    # The organization is pinned with --org, so no `az devops configure`
+    # default can redirect the read, and the watcher needs no repository. A
+    # pull request id is organization-wide, so jq accepts the record only when
+    # its id, repository, and project are the stored ones, and only a completed
+    # status wakes. An abandoned or still-active pull request, an unreadable
+    # record, and a failed sign-in all stay silent; bin/fm-pr-check.sh refuses to
+    # arm without az, its extension, or jq, and on a failed sign-in.
+    json=$(az repos pr show --id "$number" --org "$org_url" --only-show-errors --output json 2>/dev/null) || exit 0
+    [ -n "$json" ] || exit 0
+    status=$(printf '%s' "$json" | jq -r --argjson id "$number" \
+      --arg project "${project//%20/ }" --arg repo "${repo//%20/ }" '
+      if type == "object" and .pullRequestId == $id
+        and (.repository | type) == "object" and .repository.name == $repo
+        and (.repository.project | type) == "object" and .repository.project.name == $project
+        and (.status | type) == "string"
+      then .status
+      else error("not the named pull request")
+      end' 2>/dev/null) || exit 0
+    [ "$status" = completed ] && printf '%s\n' merged
     ;;
   *) exit 0 ;;
 esac

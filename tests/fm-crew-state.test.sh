@@ -1600,6 +1600,36 @@ test_terminal_passed_with_failed_gitlab_read_reports_unknown() {
   pass "terminal passed run handles failed GitLab read"
 }
 
+test_terminal_passed_with_azure_devops_pr_reads_its_state() {
+  reset_fakes
+  local d url out
+  url='https://dev.azure.com/match-best/Xelta%20V2/_git/api/pullrequest/7'
+  for state in active completed abandoned unreadable; do
+    d=$(new_case "passed-azure-$state")
+    make_repo_on_branch "$d/wt" "fm/feat-dazure$state"
+    make_fakebin "$d" >/dev/null
+    fm_fake_az "$d/fakebin"
+    : > "$d/az.log"
+    if [ "$state" = unreadable ]; then
+      : > "$d/show-fails"
+    fi
+    fm_fake_az_pr_json "$d/pr.json" "status=${state/unreadable/active}"
+    fm_write_meta "$d/state/feat-dazure$state.meta" "window=fm:fm-feat-dazure$state" \
+      "worktree=$d/wt" "kind=ship" "pr=$url"
+    FM_FAKE_AXI_STATUS="$(run_passed_with_pr "fm/feat-dazure$state" "$url")"
+    out=$(FM_TEST_AZ_DIR="$d" run_crew_state "$d" "feat-dazure$state")
+    case "$state" in
+      active) assert_contains "$out" "run passed: PR open" "an active Azure DevOps pull request is named open" ;;
+      completed) assert_contains "$out" "run passed: PR merged" "a completed Azure DevOps pull request is named merged" ;;
+      abandoned) assert_contains "$out" "run passed: PR closed" "an abandoned Azure DevOps pull request is named closed" ;;
+      unreadable) assert_contains "$out" "run passed: PR state unknown (unreadable)" "a failed Azure DevOps read is an honest unknown" ;;
+    esac
+  done
+  assert_grep 'repos pr show --id 7 --org https://dev.azure.com/match-best' "$d/az.log" \
+    "the Azure DevOps read was not pinned to the URL's organization"
+  pass "terminal passed run reads Azure DevOps pull request state"
+}
+
 test_terminal_passed_with_open_gerrit_change_does_not_claim_merged() {
   reset_fakes
   local d url read_log out
@@ -5554,6 +5584,7 @@ test_terminal_passed_without_readable_pr_identity_reports_unknown
 test_terminal_passed_with_open_gitlab_mr_does_not_claim_merged
 test_terminal_passed_with_merged_gitlab_mr_reports_merged
 test_terminal_passed_with_failed_gitlab_read_reports_unknown
+test_terminal_passed_with_azure_devops_pr_reads_its_state
 test_terminal_passed_with_open_gerrit_change_does_not_claim_merged
 test_terminal_passed_with_merged_gerrit_change_reports_merged
 test_terminal_passed_with_unreadable_gerrit_change_reports_unknown
