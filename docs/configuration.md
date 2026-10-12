@@ -742,18 +742,22 @@ The seeded home's `data/charter.md` owns the standard secondmate lifecycle and e
 ### Linked projects (config/linked-projects)
 
 A local secondmate home may keep project repositories outside the home, in the standard workspace layout `<link-root>/<project-dir>/code/<repo>`, reached through links at `projects/<project>`.
+A product made of many repositories may group them one level deeper, as `<link-root>/<project-dir>/code/<group>/<repo>`; the group level is optional, never deeper, and grouped and ungrouped repositories may be mixed in one product.
 Seed one with `fm-home-seed.sh <id> <home|-> --link-root <org-dir> <project>=<absolute repo path>...`; linked and ordinary cloned projects may be mixed in one seed.
 The home records its one link root and every linked target in its gitignored `config/linked-projects` manifest, which is never inherited from the primary.
 A home without that manifest has no link root and behaves exactly as before, and a home that already declares a link root refuses a different one.
 
-A missing target is cloned, but only into an existing `code/` folder: seeding never creates the project root, `code/`, `docs/`, or `data/`.
+A missing target is cloned, but only into an existing `code/` or `code/<group>/` folder: seeding never creates the project root, `code/`, a group directory, `README.md`, `docs/`, or `data/`.
 An existing target is adopted only when its origin matches, and project registry entries, delivery modes, and no-mistakes initialization follow the same rules as cloned projects.
 
 Containment is enforced in code at seed time and at rollback.
-A target must resolve to exactly that layout inside the link root, and must not equal, contain, or sit inside the firstmate code root, the main or active home, the secondmate home, any other local secondmate home reachable through the registries, or any other home's linked target.
-Seed rollback removes a target only when that seed cloned it, and only the link for an adopted one; it never removes `code/` itself, the project root, `README.md`, `docs/`, `data/`, or sibling repositories.
+A target must resolve to exactly one of those shapes inside the link root, and must not equal, contain, or sit inside the firstmate code root, the main or active home, the secondmate home, any other local secondmate home reachable through the registries, any other home's linked target, or another linked target in the same home.
+So a group directory is never linked as a repository while a repository inside it is linked, and a group directory must not itself be a git repository.
+Seed rollback removes a target only when that seed cloned it, and only the link for an adopted one; it never removes `code/` itself, a group directory, the project root, `README.md`, `docs/`, `data/`, or sibling repositories.
 Retirement, forced or not, never removes a linked repository, whether seed adopted or cloned it, because linked repositories are often working copies holding gitignored files no landed-work check can see.
 It removes only the home and its `projects/<project>` links, and refuses without changes while a recorded linked path is no longer a link.
+The product of a linked project is its `<project-dir>`, with no separate manifest field.
+Ship and scout briefs generated in the home for a linked project add a read-only product context section naming the product, its root `<link-root>/<project-dir>` with its `README.md` and `docs/` as the product-wide reference, and the home's other linked projects of the same product; an unlinked project gets no such section.
 [`bin/fm-linked-projects-lib.sh`](../bin/fm-linked-projects-lib.sh) owns the manifest format and the exact checks.
 Remote secondmate homes and the main home's own `projects/` do not use linked projects.
 

@@ -128,6 +128,11 @@
 # regular file, or text carrying its own "Delivery contract: mode=" line (which
 # a later scout promotion could not outrank), stops the scaffold before
 # anything is written. Secondmate charters never take it.
+# When <repo-name> is a linked project of the active secondmate home, ship and
+# scout scaffolds add a "# Product context (read-only)" section naming its
+# product, the product root, and the home's other projects of that product;
+# bin/fm-linked-projects-lib.sh owns the manifest and what a product is. A
+# malformed manifest stops the scaffold before anything is written.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -151,6 +156,8 @@ esac
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-dod-lib.sh
 . "$SCRIPT_DIR/fm-dod-lib.sh"
+# shellcheck source=bin/fm-linked-projects-lib.sh
+. "$SCRIPT_DIR/fm-linked-projects-lib.sh"
 PAUSED_VERB=${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}
 IFS= read -r -d '' CREWMATE_PAUSE_INSTRUCTIONS <<EOF || true
    Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - when deliberately waiting for work or an external condition expected to clear on its own, including your own validation round.
@@ -333,6 +340,48 @@ if [ "$KIND" != secondmate ] && { [ -e "$BRIEF_INCLUDE_FILE" ] || [ -L "$BRIEF_I
     exit 1
   fi
   [ -n "$(printf '%s' "$BRIEF_INCLUDE_BODY" | tr -d '[:space:]')" ] || BRIEF_INCLUDE_BODY=
+fi
+
+# A linked project in a secondmate home (bin/fm-linked-projects-lib.sh) belongs
+# to a product, its <project-dir>; ship and scout briefs name that product, its
+# read-only root, and the home's other projects of the same product. The
+# manifest is read before anything is written, and an unlinked project gets no
+# section.
+PRODUCT_SECTION=
+if [ "$KIND" != secondmate ]; then
+  lp_rc=0
+  fm_lp_manifest_read "$FM_HOME" || lp_rc=$?
+  if [ "$lp_rc" -eq 2 ]; then
+    printf 'error: %s\n' "$FM_LP_ERROR" >&2
+    exit 1
+  fi
+  if [ "$lp_rc" -eq 0 ] && lp_target=$(fm_lp_entry_target "${POS[1]##*/}") \
+    && lp_product=$(fm_lp_product_dir "$FM_LP_ROOT" "$lp_target"); then
+    lp_siblings=
+    while IFS='	' read -r lp_name lp_other; do
+      [ -n "$lp_name" ] && [ "$lp_other" != "$lp_target" ] || continue
+      [ "$(fm_lp_product_dir "$FM_LP_ROOT" "$lp_other" 2>/dev/null)" = "$lp_product" ] || continue
+      lp_siblings="$lp_siblings
+- \`$lp_name\` at \`$lp_other\`"
+    done <<EOF
+$FM_LP_ENTRIES
+EOF
+    PRODUCT_SECTION="# Product context (read-only)
+This project is one repository of the product \`$lp_product\`.
+Product root: \`$FM_LP_ROOT/$lp_product\`; its \`README.md\` and \`docs/\` are the product-wide reference.
+This project's repository: \`$lp_target\`."
+    if [ -n "$lp_siblings" ]; then
+      PRODUCT_SECTION="$PRODUCT_SECTION
+Other projects in this home from the same product:$lp_siblings"
+    else
+      PRODUCT_SECTION="$PRODUCT_SECTION
+No other project in this home belongs to the same product."
+    fi
+    PRODUCT_SECTION="$PRODUCT_SECTION
+You may read these paths, but change only your own task copy.
+
+"
+  fi
 fi
 
 # Append the include as the last section of a ship or scout scaffold.
@@ -637,7 +686,7 @@ $SHARED_INFRA_RULE
 
 $WAIT_BLOCK$INBOX_SECTION
 
-# Definition of done
+$PRODUCT_SECTION# Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
 The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
 $LAVISH_LINE
@@ -721,7 +770,7 @@ $WAIT_BLOCK$INBOX_SECTION
 A project's \`AGENTS.md\` or \`CLAUDE.md\` is loaded into every agent session in that project, so edit it only to correct information that is factually wrong - including information your own change made wrong - and never to add knowledge because it is missing.
 A correction edits only the wrong text: do not run \`$FM_ROOT/bin/fm-ensure-agents-md.sh\`, create either file, or add sections, headings, or pointers alongside it.
 
-$DOD
+$PRODUCT_SECTION$DOD
 EOF
 append_brief_include
 if [ "$FORGE" = none ]; then

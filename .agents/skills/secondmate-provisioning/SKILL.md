@@ -66,7 +66,7 @@ Provision a local persistent home and registry entry after the charter is filled
 bin/fm-home-seed.sh <id> <home|-> [--link-root <org-dir>] {<project>[=<repo-path>]...|--no-projects}
 ```
 
-A `<project>=<repo-path>` spec links a local home's project to a repository that stays in the captain's workspace layout, `<org-dir>/<project-dir>/code/<repo>`, instead of cloning it into the home.
+A `<project>=<repo-path>` spec links a local home's project to a repository that stays in the captain's workspace layout, `<org-dir>/<project-dir>/code/<repo>` or, for a product whose repositories are grouped, `<org-dir>/<project-dir>/code/<group>/<repo>`, instead of cloning it into the home.
 Use it when the captain wants that secondmate to work in the org's own project repositories; [`docs/configuration.md`](../../../docs/configuration.md#linked-projects-configlinked-projects) owns the contract, including which folders cleanup may never remove.
 
 Provision a whole remote home through its configured SSH host with:
@@ -161,7 +161,7 @@ Run `bin/fm-home-seed.sh validate` when checking registry integrity; its header 
 
 Seeding is transactional.
 If validation, cloning, no-mistakes initialization, or registry update fails, generated briefs, new homes, new project clones, and registry edits are rolled back.
-A linked project's rollback removes only a `code/<repo>` that seed cloned and the link it created.
+A linked project's rollback removes only a repository directory that seed cloned and the link it created, never `code/` or a group directory.
 
 Secondmate project lists may include `no-mistakes` and `direct-PR` projects only.
 `local-only` projects stay with the main firstmate.
