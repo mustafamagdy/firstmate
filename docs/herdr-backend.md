@@ -821,12 +821,16 @@ Opening the same topic again focuses its existing tab instead of creating anothe
 
 The topic agent is an ordinary session, not a firstmate session, so it never takes or meets the session lock and never reports itself read-only.
 It reads code, reports, PR state, and `fm-inbox.sh status`, and hands work to the main firstmate's inbox as a note tagged `[topic:<topic>]` instead of steering a second mate or changing project code itself.
-The main firstmate appends each result for the topic with `bin/fm-topic.sh log`, and the tab reads that log when the captain asks what is new; notifications, approvals, and merges stay on the main screen.
+The main firstmate appends each result for the topic with `bin/fm-topic.sh log`, which also types one short constant doorbell line into the live tab, so the tab agent tells the captain the outcome there; notifications, approvals, and merges stay on the main screen.
+A busy tab queues the doorbell until its turn ends, and a closed tab, a missing agent, or the captain's own unsent text in the tab skips it without failing the log.
+The tab agent's Claude Code `UserPromptSubmit` hook shows every not-yet-shown result before each prompt, the doorbell included, so a skipped or lost doorbell is caught up by the captain's next message there or by reopening the topic.
+Work routed from a tab is linked to its topic, and the wake drain prints a `TOPIC RESULT` reminder with the exact log command whenever that work reports an outcome.
 The tab runs Claude in the captain's own default permission mode, after its folder's workspace trust is pre-registered.
 
 A topic folder must sit strictly inside one of the captain's workspace roots, `config/topic-roots` or `$HOME` by default, and must not be or sit inside a firstmate home.
 Running `fm-topic.sh` outside a Herdr pane refuses, because no other runtime supports topic tabs.
-The script header owns the exact commands, folder policy, and the records under `data/topics/<topic>/`; the `topic-tabs` skill owns when the main firstmate uses them.
+The script header owns the exact commands, folder policy, delivery conditions, and the records under `data/topics/<topic>/`; the `topic-tabs` skill owns when the main firstmate uses them.
+A tab opened before result delivery existed has no hook; close it and open the topic again to get one.
 
 ## Destructive lab safety
 

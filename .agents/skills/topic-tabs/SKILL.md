@@ -24,9 +24,13 @@ It is not a firstmate session, so it never takes or meets this home's session lo
 ## Work arriving from a topic tab
 
 An inbox note starting with `[topic:<topic>]` is an ordinary captain request that came from that tab.
-Resolve, route, brief, and supervise it exactly like any other request, keeping the topic name in the backlog item note so its result can find its way back.
+Resolve, route, brief, and supervise it exactly like any other request, keeping the topic name in the backlog item note.
+In the same turn you dispatch it, link the work to the topic with `bin/fm-topic.sh link <topic> <id>`, where `<id>` is the task id you spawned or the second mate id you routed it to.
+From then on the wake drain prints a `TOPIC RESULT` line with the exact log command whenever that task or second mate reports an outcome, so the result goes back to the tab without relying on memory.
 
 ## Reporting a topic's results
 
 Whenever a result lands for work that came from a topic tab - a finished investigation, a PR ready for review, a merge, a blocker, or a decision the captain must make - append it with `bin/fm-topic.sh log <topic> "<text>"` in plain captain-facing language with any full PR URL, and keep a one-line note in the main chat.
+Logging also rings the topic tab, so its agent tells the captain the outcome there; the second output line says whether it was delivered or why not, and an undelivered result is shown with the captain's next message in the tab or when the topic is opened again, so never retry or type into the tab yourself.
+Add `--done <id>` with the final result for a linked request so its `TOPIC RESULT` reminders stop.
 Approvals, merges, and other decisions still happen on the main screen; the topic log only mirrors them.

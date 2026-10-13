@@ -449,6 +449,42 @@ test_routine_working_and_covered_done_stay_silent_on_the_empty_queue() {
   pass "routine working and branch-covered done lines print nothing on an empty-queue drain"
 }
 
+test_linked_topic_task_prints_topic_result_reminder() {
+  local dir state out data
+  dir=$(make_case topic-result)
+  state="$dir/state"
+  data="$dir/data"
+  out="$dir/drain.out"
+  mkdir -p "$data/topics/xelta" "$data/topics/crm"
+  printf 'topic=xelta\n' > "$data/topics/xelta/topic.meta"
+  printf 'mbg\n' > "$data/topics/xelta/links"
+  printf 'topic=crm\n' > "$data/topics/crm/topic.meta"
+  printf 'other-task\n' > "$data/topics/crm/links"
+  printf 'note: area and team created\n' > "$state/mbg.status"
+  append_wake "$state" signal mbg.status "note: area and team created" \
+    || fail "queueing the linked task's wake failed"
+
+  FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" "$DRAIN" > "$out" || fail "drain failed with a linked topic"
+
+  grep -F 'TOPIC RESULT: mbg carries a request from the xelta topic tab' "$out" \
+    | grep -F 'bin/fm-topic.sh log xelta "<outcome>", adding --done mbg' >/dev/null \
+    || fail "the linked task's outcome did not print its topic log command: $(cat "$out")"
+  if grep -F 'crm topic tab' "$out" >/dev/null; then
+    fail "a topic linked to another task was named: $(cat "$out")"
+  fi
+
+  dir=$(make_case topic-result-unlinked)
+  state="$dir/state"
+  out="$dir/drain.out"
+  printf 'note: unrelated\n' > "$state/task9.status"
+  append_wake "$state" signal task9.status "note: unrelated" || fail "queueing the unlinked wake failed"
+  FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" "$DRAIN" > "$out" || fail "drain failed with an unlinked task"
+  if grep -F 'TOPIC RESULT' "$out" >/dev/null; then
+    fail "an unlinked task printed a topic reminder: $(cat "$out")"
+  fi
+  pass "a presented outcome for a topic-linked task names the exact topic log command"
+}
+
 test_incident_note_answer_buried_under_routine_note_surfaces_both
 test_already_presented_notes_are_not_replayed
 test_brand_new_note_after_presentation_is_surfaced
@@ -463,3 +499,4 @@ test_snapshot_failure_is_visible
 test_open_decisions_fold_is_unchanged
 test_empty_queue_does_not_swallow_later_signal_annotation
 test_routine_working_and_covered_done_stay_silent_on_the_empty_queue
+test_linked_topic_task_prints_topic_result_reminder

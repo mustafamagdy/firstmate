@@ -4,8 +4,13 @@
 # Runs the real bin/fm-topic.sh from a scratch "firstmate" pane in a named lab
 # session and proves, against Herdr itself: open creates a labeled tab in that
 # pane's own workspace, starts the topic agent there in the topic folder, and
-# focuses it; reopening the topic focuses the same tab without creating another.
-# The agent is a token-free stand-in, so this spends no model tokens.
+# focuses it; reopening the topic focuses the same tab without creating another;
+# logging a result types the doorbell into the live tab, whose prompt hook then
+# shows the result once; and a result logged while the tab is closed is shown
+# first by the recreated tab.
+# The agent is a token-free stand-in that registers itself with Herdr and runs
+# the topic's prompt hook on its first prompt and on every line it receives, as
+# Claude Code does, so this spends no model tokens.
 # tests/fm-topic.test.sh covers the refusal and record paths offline.
 #
 # Safety: every Herdr call goes through bin/fm-herdr-lab.sh or carries the lab
@@ -57,11 +62,23 @@ TOPIC_DIR="$WORK/saas/crm"
 mkdir -p "$HOME_DIR/data" "$HOME_DIR/config" "$TOPIC_DIR" "$TMP_ROOT/claude-config" "$TMP_ROOT/bin"
 printf '%s\n' "$WORK" > "$HOME_DIR/config/topic-roots"
 printf 'Starting note: one open PR.\n' > "$TMP_ROOT/note.md"
-cat > "$TMP_ROOT/bin/stand-in-agent" <<'SH'
-#!/usr/bin/env bash
-echo "topic-agent-up name=$2 cwd=$PWD"
-exec sleep 600
-SH
+cat > "$TMP_ROOT/bin/stand-in-agent" <<AGENT
+#!/usr/bin/env python3
+import json, os, subprocess, sys
+args = sys.argv[1:]
+subprocess.run(["herdr", "pane", "report-agent", "--source", "fm-topic-e2e", "--agent", "stand-in",
+                "--state", "idle", os.environ["HERDR_PANE_ID"], "--session", "$HERDR_LAB_SESSION"],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+with open(args[args.index("--settings") + 1]) as f:
+    hook = json.load(f)["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+def prompt(text):
+    print("prompt: " + text.strip(), flush=True)
+    print(subprocess.run(["bash", "-c", hook], capture_output=True, text=True).stdout, flush=True)
+print("topic-agent-up name=%s cwd=%s" % (args[1], os.getcwd()), flush=True)
+prompt(args[-1])
+for line in sys.stdin:
+    prompt(line)
+AGENT
 chmod +x "$TMP_ROOT/bin/stand-in-agent"
 
 # The scratch "main firstmate" pane lives in an unfocused workspace while
@@ -110,6 +127,33 @@ case "$out" in *"focused: crm tab $TAB (existing)"*) ;; *) fail "reopen did not 
 [ "$(focused_tab)" = "$TAB" ] && [ "$(focused_ws)" = "$MAIN_WS" ] || fail "reopen did not focus the existing tab"
 [ "$(lab tab list --workspace "$MAIN_WS" | jq '.result.tabs | length')" = 2 ] || fail "reopen created an extra tab"
 pass "reopening the topic focuses the same tab without creating another"
+
+pane_shows() {  # <pane> <text>: wait for <text> in the pane's recent output
+  for _ in $(seq 1 50); do
+    lab pane read "$1" --source recent --lines 400 2>/dev/null | grep -F -- "$2" >/dev/null && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+out=$(run_topic log crm "The CRM import fix is merged: https://example.invalid/pr/7" 2>&1) || fail "log failed: $out"
+case "$out" in *"delivered: crm tab $TAB"*) ;; *) fail "log did not deliver into the live tab: $out" ;; esac
+pane_shows "$PANE" "prompt: : New crm topic result from the main firstmate" \
+  || fail "the doorbell line did not reach the live tab"
+pane_shows "$PANE" "The CRM import fix is merged: https://example.invalid/pr/7" \
+  || fail "the prompt hook did not show the logged result in the tab"
+[ -z "$(run_topic unseen crm)" ] || fail "the result shown through the hook is still unseen"
+pass "logging a result rings the live tab, whose prompt hook shows it once"
+
+lab tab close "$TAB" >/dev/null || fail "could not close the topic tab"
+out=$(run_topic log crm "Second result while the tab was closed" 2>&1) || fail "log with the tab closed failed: $out"
+case "$out" in *"not delivered: its tab is closed or its pane is gone"*) ;; *) fail "log with the tab closed did not report the skip: $out" ;; esac
+out=$(run_topic open crm "$TOPIC_DIR" 2>&1) || fail "reopen after close failed: $out"
+TAB=$(topic_tabs)
+PANE=$(lab pane list --workspace "$MAIN_WS" | jq -r --arg t "$TAB" '.result.panes[] | select(.tab_id == $t) | .pane_id')
+pane_shows "$PANE" "Second result while the tab was closed" \
+  || fail "the recreated tab did not show the result logged while it was closed"
+pass "a result logged while the tab is closed is shown first by the recreated tab"
 
 cleanup_all || { printf 'not ok - lab teardown or default-session tripwire failed\n' >&2; exit 1; }
 pass "lab torn down with the default session unchanged"

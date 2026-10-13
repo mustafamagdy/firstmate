@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # tests/fm-topic.test.sh - topic tabs (bin/fm-topic.sh) against a stateful fake
 # herdr: create, reuse of an existing tab, label adoption and ambiguity,
-# directory refusals, the generated launcher, the topic log, and the inbox
-# handoff command the topic agent is told to run.
-# tests/fm-topic-herdr-e2e.test.sh proves create, reuse, and focus on real Herdr.
+# directory refusals, the generated launcher and its unseen-results hook, the
+# topic log with its seen tracking and skipped deliveries, task links, and the
+# inbox handoff command the topic agent is told to run.
+# tests/fm-topic-herdr-e2e.test.sh proves create, reuse, focus, and doorbell
+# delivery on real Herdr.
 set -euo pipefail
 
 # shellcheck source=tests/lib.sh
@@ -57,6 +59,9 @@ elif cmd == ["pane", "get"]:
     if p is None:
         sys.exit(1)
     out({"result": {"pane": p}})
+elif cmd == ["agent", "get"]:
+    print(json.dumps({"error": {"code": "agent_not_found", "message": "no agent"}}))
+    sys.exit(1)
 elif cmd == ["pane", "list"]:
     out({"result": {"panes": [p for p in st["panes"] if p["workspace_id"] == opt("--workspace")]}})
 elif cmd == ["pane", "run"]:
@@ -211,7 +216,15 @@ assert_contains "$args" "claude_config=$CLAUDE_STORE" "the agent uses the Claude
 assert_contains "$args" $'arg=--name\narg=xelta' "the session is named for the topic"
 assert_contains "$args" $'arg=--add-dir\narg='"$XDIR" "the agent can read its topic records"
 assert_contains "$args" "You are the xelta topic chat" "the standing instructions are appended to the system prompt"
-assert_contains "$args" "Read your topic log at $XDIR/log.md" "without a starting note the first prompt points at the log"
+assert_contains "$args" "read your topic log at $XDIR/log.md" "without a starting note the first prompt points at the log"
+assert_contains "$args" "Show the captain any unseen topic results first" "the first prompt shows unseen results first"
+assert_contains "$args" $'arg=--settings\narg='"$XDIR/settings.json" "the agent runs with the topic's hook settings"
+hook=$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].command' "$XDIR/settings.json")
+assert_contains "$hook" "fm-topic.sh unseen xelta --hook" "every prompt first runs the unseen-results hook"
+rc=0
+out=$(env -u FM_HOME bash -c "$hook") || rc=$?
+expect_code 0 "$rc" "the hook succeeds with nothing unseen"
+assert_equals "" "$out" "the hook is silent with nothing unseen"
 assert_not_contains "$(cat "$XDIR/instructions.md")" "{{" "every template placeholder is rendered"
 pass "the generated launcher starts the topic agent with its instructions"
 
@@ -308,7 +321,11 @@ pass "open outside Herdr refuses with a clear message"
 
 # --- log and list ---------------------------------------------------------
 
-run_topic log crm "The CRM import fix is merged: https://example.invalid/pr/7" >/dev/null
+: > "$CALLS"
+out=$(run_topic log crm "The CRM import fix is merged: https://example.invalid/pr/7")
+assert_contains "$out" "logged: crm" "logging reports the entry"
+assert_contains "$out" "not delivered: its tab is closed or its pane is gone" "a closed tab skips delivery and says why"
+assert_no_grep "send-text" "$CALLS" "nothing is typed for a closed tab"
 printf 'Second result\nwith two lines\n' | run_topic log crm - >/dev/null
 log=$(cat "$TDIR/log.md")
 assert_contains "$log" "The CRM import fix is merged: https://example.invalid/pr/7" "a logged result is appended"
@@ -322,6 +339,71 @@ expect_code 1 "$rc" "an empty log entry is refused"
 list=$(run_topic list)
 assert_contains "$list" "crm"$'\t'"$WORK/saas/crm" "list names each topic and its folder"
 pass "results append to the topic log and list shows topics"
+
+# --- unseen results -------------------------------------------------------
+
+out=$(run_topic unseen crm)
+assert_contains "$out" "The CRM import fix is merged: https://example.invalid/pr/7" "unseen prints the first result"
+assert_contains "$out" $'Second result\nwith two lines' "unseen prints the second result"
+assert_not_contains "$out" "topic log" "unseen never prints the log title"
+assert_equals "" "$(run_topic unseen crm)" "a shown result is never shown again"
+rc=0
+out=$(run_topic unseen crm --hook) || rc=$?
+expect_code 0 "$rc" "the hook succeeds with nothing unseen"
+assert_equals "" "$out" "the hook prints nothing with nothing unseen"
+run_topic log crm "Third result" >/dev/null
+out=$(run_topic unseen crm --hook)
+assert_contains "$out" "Unseen crm topic results from the main firstmate" "the hook frames unseen results for the agent"
+assert_contains "$out" "Third result" "the hook shows the new result"
+assert_not_contains "$out" "Second result" "the hook shows only results not yet shown"
+assert_equals "" "$(run_topic unseen crm --hook)" "the hook marks what it showed as seen"
+rc=0
+out=$(run_topic unseen nothere --hook) || rc=$?
+expect_code 0 "$rc" "the hook never fails a prompt, even for an unknown topic"
+assert_equals "" "$out" "the hook prints nothing for an unknown topic"
+mkdir -p "$HOME_DIR/data/topics/legacy"
+printf 'topic=legacy\n' > "$HOME_DIR/data/topics/legacy/topic.meta"
+printf '# legacy topic log\n\n## 2026-10-13T07:40:51Z\n\nArea and team created.\n' > "$HOME_DIR/data/topics/legacy/log.md"
+out=$(run_topic unseen legacy)
+assert_contains "$out" "Area and team created." "a log from before seen tracking shows its results as unseen"
+assert_not_contains "$out" "legacy topic log" "the legacy log's title is not shown"
+pass "unseen shows each result exactly once and the hook stays silent and safe"
+
+# --- delivery to a live tab without an agent ------------------------------
+
+reset_herdr
+run_topic open crm "$WORK/saas/crm" >/dev/null
+: > "$CALLS"
+out=$(run_topic log crm "Fourth result")
+assert_contains "$out" "not delivered: no live agent is running in the tab" "a tab without a live agent is not typed into"
+assert_no_grep "send-text" "$CALLS" "nothing is typed without a live agent"
+out=$(run_topic open crm "$WORK/saas/crm")
+assert_contains "$out" "focused: crm tab" "reopening focuses the existing tab"
+assert_contains "$out" "not delivered: no live agent" "reopening a tab with unseen results rings it"
+run_topic unseen crm >/dev/null
+out=$(run_topic open crm "$WORK/saas/crm")
+assert_not_contains "$out" "delivered" "reopening with nothing unseen rings nothing"
+pass "delivery is skipped safely when no agent can receive it, and reopening rings for unseen results"
+
+# --- task links -----------------------------------------------------------
+
+assert_contains "$(run_topic link crm fm-crm-fix)" "linked: fm-crm-fix -> crm" "a task is linked to its topic"
+run_topic link crm fm-crm-fix >/dev/null
+assert_equals 1 "$(grep -cx fm-crm-fix "$TDIR/links")" "linking twice records the task once"
+out=$(run_topic hint fm-crm-fix unrelated)
+assert_contains "$out" 'TOPIC RESULT: fm-crm-fix carries a request from the crm topic tab' "a linked task names its topic"
+assert_contains "$out" 'bin/fm-topic.sh log crm "<outcome>", adding --done fm-crm-fix' "the hint names the exact log command"
+assert_equals 1 "$(printf '%s\n' "$out" | grep -c 'TOPIC RESULT')" "an unlinked task prints no hint"
+run_topic log crm --done fm-crm-fix "The CRM fix is merged." >/dev/null
+assert_contains "$(cat "$TDIR/log.md")" "The CRM fix is merged." "a final result is logged"
+assert_equals "" "$(run_topic hint fm-crm-fix)" "--done unlinks the finished task"
+run_topic link crm mbg >/dev/null
+run_topic unlink crm mbg >/dev/null
+assert_equals "" "$(run_topic hint mbg)" "unlink removes a link"
+rc=0
+run_topic link crm 'bad id' >/dev/null 2>&1 || rc=$?
+expect_code 1 "$rc" "an invalid task id is refused"
+pass "task links drive topic result hints until the final result unlinks them"
 
 rc=0
 run_topic open 'bad/name' "$WORK/saas/crm" >/dev/null 2>&1 || rc=$?
