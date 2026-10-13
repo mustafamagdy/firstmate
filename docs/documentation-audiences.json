@@ -257,6 +257,14 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/topic-tabs/assets/topic-agent.md",
+      "audience": "agent-runtime"
+    },
+    {
+      "path": ".agents/skills/topic-tabs/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/updatefirstmate/SKILL.md",
       "audience": "agent-runtime"
     },

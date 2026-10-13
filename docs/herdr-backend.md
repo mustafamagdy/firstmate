@@ -25,6 +25,7 @@ Herdr provides the terminal session while Treehouse continues to provide task wo
 | What happens after a Herdr server restart and how liveness is judged | [Restart and liveness behavior](#restart-and-liveness-behavior) |
 | How blocked transitions arrive and what happens without protocol 16 | [Push events and polling fallback](#push-events-and-polling-fallback) |
 | Where the away daemon runs and how it stops | [Away-mode supervisor support](#away-mode-supervisor-support) |
+| Opening a separate chat tab for one topic | [Topic tabs](#topic-tabs) |
 | Stopping or deleting Herdr sessions during verification | [Destructive lab safety](#destructive-lab-safety) |
 | Known limits and the test suite | [Active limits](#active-limits) and [Regression entry points](#regression-entry-points) |
 
@@ -811,6 +812,22 @@ On stop:
 
 A fresh entry clears stale transient escalation caches, while durable queue and task records remain authoritative.
 
+## Topic tabs
+
+A topic tab is a separate Claude Code chat for one captain topic, such as a CRM or a product, opened when the captain says "open <topic>" to the main firstmate.
+`bin/fm-topic.sh open <topic> <dir>` creates a tab labeled `topic:<topic>` in the calling firstmate's own workspace, resolved from its injected pane identity the same way [Placement beside the launcher](#placement-beside-the-launcher) is, starts the topic agent there with `<dir>` as its working directory, and focuses it.
+Focusing the tab also brings that workspace to the front.
+Opening the same topic again focuses its existing tab instead of creating another, and two tabs carrying the same topic label refuse as ambiguous rather than guessing.
+
+The topic agent is an ordinary session, not a firstmate session, so it never takes or meets the session lock and never reports itself read-only.
+It reads code, reports, PR state, and `fm-inbox.sh status`, and hands work to the main firstmate's inbox as a note tagged `[topic:<topic>]` instead of steering a second mate or changing project code itself.
+The main firstmate appends each result for the topic with `bin/fm-topic.sh log`, and the tab reads that log when the captain asks what is new; notifications, approvals, and merges stay on the main screen.
+The tab runs Claude in the captain's own default permission mode, after its folder's workspace trust is pre-registered.
+
+A topic folder must sit strictly inside one of the captain's workspace roots, `config/topic-roots` or `$HOME` by default, and must not be or sit inside a firstmate home.
+Running `fm-topic.sh` outside a Herdr pane refuses, because no other runtime supports topic tabs.
+The script header owns the exact commands, folder policy, and the records under `data/topics/<topic>/`; the `topic-tabs` skill owns when the main firstmate uses them.
+
 ## Destructive lab safety
 
 Never use ambient `herdr server stop` for Firstmate verification.
@@ -860,6 +877,8 @@ tests/fm-herdr-session-cleanup-e2e.test.sh
 tests/fm-herdr-attached-viewer-live-e2e.test.sh
 tests/fm-afk-inject-herdr-e2e.test.sh
 tests/fm-afk-pi-herdr-return-e2e.test.sh
+tests/fm-topic.test.sh
+tests/fm-topic-herdr-e2e.test.sh
 ```
 
 Real Herdr tests use the named lab helper and default-session tripwire.
