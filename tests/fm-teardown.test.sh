@@ -788,6 +788,29 @@ SH
   pass "teardown closes a landed Gerrit task with its change URL as a note and a GitHub task with --pr"
 }
 
+test_teardown_closes_an_azure_devops_task_with_its_pr_url_as_a_note() {
+  local case_dir out url n=0
+  for url in https://dev.azure.com/example/Example%20Project/_git/api/pullrequest/2483 \
+    https://example.visualstudio.com/Example%20Project/_git/api/pullrequest/2483; do
+    n=$((n + 1))
+    case_dir=$(make_case "tasks-axi-close-azure-$n")
+    write_meta "$case_dir" direct-PR ship
+    printf 'pr=%s\n' "$url" >> "$case_dir/state/task-x1.meta"
+    seed_backlog_in_flight "$case_dir"
+    cp "$TMP_ROOT/tasks-axi-close-gerrit/fakebin/tasks-axi" "$case_dir/fakebin/tasks-axi"
+
+    out=$(run_teardown "$case_dir" 2>&1) || fail "teardown of a landed Azure DevOps task failed: $out"
+    [ "$(backlog_row_state "$case_dir")" = "done" ] \
+      || fail "teardown left a landed Azure DevOps task's backlog item at $(backlog_row_state "$case_dir"): $out"
+    tasks-axi show task-x1 --file "$case_dir/data/backlog.md" --full \
+      | grep -F "body: \"Azure DevOps pull request $url\"" >/dev/null \
+      || fail "closed Azure DevOps backlog item did not record its pull request URL as a note"
+    assert_absent "$case_dir/state/task-x1.backlog-close" \
+      "a landed Azure DevOps close left its pending-close record behind"
+  done
+  pass "teardown closes a landed Azure DevOps task with its pull request URL as a note"
+}
+
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator() {
   local case_dir out backlog_path
   case_dir=$(make_case tasks-axi-manual-optout)
@@ -4983,6 +5006,7 @@ test_retained_sources_still_reach_the_ordinary_refusal
 test_local_only_fork_remote_allows
 test_teardown_closes_the_backlog_item_itself
 test_teardown_closes_a_gerrit_task_with_its_change_url_as_a_note
+test_teardown_closes_an_azure_devops_task_with_its_pr_url_as_a_note
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows

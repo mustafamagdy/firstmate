@@ -557,19 +557,47 @@ SH
 #   repos pr show       prints "pr.json", or "pr-post.json" once a completion
 #                       was accepted (unless "stays-active" exists)
 #   repos pr policy list prints "policies.json" ("[]" when absent)
-#   devops invoke       copies its --in-file to "invoke-body.json" and accepts
-#                       the completion, unless "invoke-fails" exists
+#   --version           names <fakebin>/az-python as the Python az runs on,
+#                       unless "no-python" exists
+# The az-python stub stands in for the azure-devops extension client that
+# fm_pr_azure_invoke_location runs: it logs "location <method> <location-id>
+# <api-version> <route-values-json> --org <org-url>" to az.log, copies its body file to
+# "invoke-body.json", and accepts the completion, unless "invoke-fails" exists.
 # "auth-fails" makes every pull-request call fail the way az does without a
 # sign-in, and "show-fails" makes the pull-request read fail generically. Any
 # other call fails with status 91.
 fm_fake_az() {
   local fakebin=$1
+  cat > "$fakebin/az-python" <<'SH'
+#!/usr/bin/env bash
+dir=${FM_TEST_AZ_DIR:?FM_TEST_AZ_DIR is required by the fake az}
+[ "${1:-} ${2:-}" = "-I -c" ] || { echo "unexpected az-python call: $*" >&2; exit 91; }
+shift 2
+printf 'location %s %s %s %s --org %s\n' "$3" "$4" "$5" "$6" "$2" >> "$dir/az.log"
+if [ -e "$dir/auth-fails" ]; then
+  echo "ERROR: Before you can run Azure DevOps commands, you need to run the login command (az login if using AAD/MSA identity else az devops login if using PAT token) to setup credentials." >&2
+  exit 1
+fi
+[ -z "${7:-}" ] || cp "$7" "$dir/invoke-body.json"
+if [ -e "$dir/invoke-fails" ]; then
+  echo "ERROR: TF401181: The pull request cannot be completed because the source branch was updated." >&2
+  exit 1
+fi
+: > "$dir/completed"
+echo '{}'
+SH
+  chmod +x "$fakebin/az-python"
   cat > "$fakebin/az" <<'SH'
 #!/usr/bin/env bash
 dir=${FM_TEST_AZ_DIR:?FM_TEST_AZ_DIR is required by the fake az}
 printf '%s\n' "$*" >> "$dir/az.log"
 case "${1:-} ${2:-}" in
   "extension show") [ ! -e "$dir/no-extension" ]; exit ;;
+  "--version ")
+    printf 'azure-cli                         2.90.0\n\n'
+    [ -e "$dir/no-python" ] || printf "Python location '%s/az-python'\n" "$(dirname "$0")"
+    exit 0
+    ;;
 esac
 if [ -e "$dir/auth-fails" ]; then
   echo "ERROR: Before you can run Azure DevOps commands, you need to run the login command (az login if using AAD/MSA identity else az devops login if using PAT token) to setup credentials." >&2
@@ -586,19 +614,6 @@ case "${1:-} ${2:-} ${3:-} ${4:-}" in
     ;;
   "repos pr policy list")
     if [ -e "$dir/policies.json" ]; then cat "$dir/policies.json"; else echo '[]'; fi
-    ;;
-  "devops invoke "*)
-    prev=
-    for arg in "$@"; do
-      [ "$prev" != --in-file ] || cp "$arg" "$dir/invoke-body.json"
-      prev=$arg
-    done
-    if [ -e "$dir/invoke-fails" ]; then
-      echo "ERROR: TF401181: The pull request cannot be completed because the source branch was updated." >&2
-      exit 1
-    fi
-    : > "$dir/completed"
-    echo '{}'
     ;;
   *)
     printf 'unexpected az call: %s\n' "$*" >&2

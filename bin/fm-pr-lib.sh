@@ -1284,7 +1284,7 @@ fm_pr_azure_missing() {
 # authenticate, so a caller can name the missing sign-in instead of a vague
 # read failure.
 fm_pr_azure_run() {  # <org-url> <az-args...>
-  local org=$1 err first rc=0
+  local org=$1 err rc=0
   shift
   FM_PR_AZURE_OUT=
   FM_PR_AZURE_ERROR=
@@ -1298,6 +1298,14 @@ fm_pr_azure_run() {  # <org-url> <az-args...>
     rm -f "$err"
     return 0
   fi
+  fm_pr_azure_fail "$org" "$rc" "$err"
+}
+
+# Turn one failed Azure DevOps call into the FM_PR_AZURE_* failure contract
+# fm_pr_azure_run documents, from its exit status and the file holding its
+# stderr, which is removed.
+fm_pr_azure_fail() {  # <org-url> <exit-status> <stderr-file>
+  local org=$1 rc=$2 err=$3 first
   FM_PR_AZURE_OUT=
   if grep -qiE 'az (devops )?login|TF400813|unauthori[sz]ed|not authori[sz]ed|authentication|(^|[^0-9])401([^0-9]|$)|personal access token' "$err" 2>/dev/null; then
     FM_PR_AZURE_AUTH_FAILED=true
@@ -1308,6 +1316,60 @@ fm_pr_azure_run() {  # <org-url> <az-args...>
   fi
   rm -f "$err"
   return 1
+}
+
+# Call one Azure DevOps REST location by its id, through the azure-devops
+# extension's own client running inside the Python that az itself runs on, so
+# the connection, the --org pinning, and the authentication are exactly the
+# ones every other az call here uses. `az devops invoke` cannot do this: it
+# picks a location by area and resource name alone, and a name such as git
+# pullRequests covers several locations, of which it resolves the read-only
+# {project}/_apis/git/pullRequests/{id} and silently drops a repositoryId
+# route value, so a PATCH through it is refused with "does not support http
+# method PATCH". <route-values-json> is a JSON object of route values, and the
+# optional <body-file> holds the JSON request body. Success and failure follow
+# the fm_pr_azure_run contract, with FM_PR_AZURE_OUT holding the response.
+fm_pr_azure_invoke_location() {  # <org-url> <http-method> <location-id> <api-version> <route-values-json> [<body-file>]
+  local org=$1 python err rc=0
+  FM_PR_AZURE_OUT=
+  FM_PR_AZURE_ERROR=
+  FM_PR_AZURE_AUTH_FAILED=false
+  python=$(az --version 2>/dev/null | sed -n "s/^Python location '\(.*\)'[[:space:]]*\$/\1/p" | head -n 1) || true
+  if [ -z "$python" ] || [ ! -x "$python" ]; then
+    FM_PR_AZURE_ERROR="could not find the Python that az runs on (az --version names no usable Python location)"
+    return 1
+  fi
+  err=$(mktemp "${TMPDIR:-/tmp}/fm-pr-azure.XXXXXX") || {
+    FM_PR_AZURE_ERROR="could not create a temporary file for the az call"
+    return 1
+  }
+  FM_PR_AZURE_OUT=$("$python" -I -c '
+import json
+import sys
+from azure.cli.core.extension import get_extension_path
+sys.path.insert(0, get_extension_path("azure-devops"))
+from azext_devops.dev.common.services import get_connection
+from azext_devops.devops_sdk.client import Client
+org, method, location, version, routes = sys.argv[1:6]
+try:
+    body = None
+    if len(sys.argv) > 6:
+        with open(sys.argv[6], encoding="utf-8") as handle:
+            body = json.load(handle)
+    connection = get_connection(org)
+    client = Client(connection.base_url, connection._creds)
+    response = client._send(http_method=method, location_id=location, version=version,
+                            route_values=json.loads(routes), content=body)
+    sys.stdout.write(json.dumps(response.json()))
+except Exception as error:  # pylint: disable=broad-except
+    sys.stderr.write("ERROR: %s\n" % error)
+    sys.exit(1)
+' "$@" 2>"$err") || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$err"
+    return 0
+  fi
+  fm_pr_azure_fail "$org" "$rc" "$err"
 }
 
 # Read one Azure DevOps pull request and keep it only when it is exactly the

@@ -3933,11 +3933,16 @@ test_azure_devops_green_pr_completes_with_the_verified_head() {
   [ "$(jq -r '.status + " " + .lastMergeSourceCommit.commitId + " " + .completionOptions.mergeStrategy' \
     "$case_dir/invoke-body.json")" = "completed $AZ_HEAD squash" ] \
     || fail "azure-green: the completion did not bind the verified head and squash: $(cat "$case_dir/invoke-body.json")"
-  grep -q -- '--route-parameters project=66666666-7777-8888-9999-000000000000 repositoryId=11111111-2222-3333-4444-555555555555 pullRequestId=7 --http-method PATCH' \
-    "$case_dir/az.log" || fail "azure-green: the completion did not address the read project and repository ids"
+  grep -qxF -- 'location PATCH 9946fd70-0d40-406e-b686-b4744cbbcc37 7.1 {"project":"66666666-7777-8888-9999-000000000000","repositoryId":"11111111-2222-3333-4444-555555555555","pullRequestId":"7"} --org '"$AZ_ORG_URL" \
+    "$case_dir/az.log" \
+    || fail "azure-green: the completion did not PATCH the repository-scoped pull request location with the read project and repository ids: $(grep '^location' "$case_dir/az.log")"
+  assert_no_grep 'devops invoke' "$case_dir/az.log" \
+    "azure-green: the completion went through az devops invoke, which resolves a read-only location"
   while IFS= read -r line; do
     case "$line" in
-      "extension show"*) ;;
+      "extension show"* | --version) ;;
+      "location "*) case "$line" in *" --org $AZ_ORG_URL") ;;
+           *) fail "azure-green: the completion was not pinned to the URL's organization: $line" ;; esac ;;
       *) case "$line" in *"--org $AZ_ORG_URL --only-show-errors --output json") ;;
            *) fail "azure-green: an az call was not pinned to the URL's organization: $line" ;; esac ;;
     esac
@@ -4060,7 +4065,17 @@ test_azure_devops_completion_not_proven_refuses() {
     "azure-invoke-fails: the refused completion was not reported"
   [ ! -e "$case_dir/state/task-x1.pr-poll-merge-notified" ] \
     || fail "azure-invoke-fails: a refused completion was recorded as landed"
-  pass "an Azure DevOps completion that is refused or never reads completed records nothing as landed"
+
+  case_dir=$(make_azure_case azure-no-python)
+  : > "$case_dir/no-python"
+  azure_merge "$case_dir"
+  expect_code 1 "$AZURE_RC" "azure-no-python: a completion with no usable az Python should fail"
+  assert_grep 'could not find the Python that az runs on' "$case_dir/stderr" \
+    "azure-no-python: the missing az Python was not named"
+  assert_absent "$case_dir/invoke-body.json" "azure-no-python: a completion was sent without the az Python"
+  [ ! -e "$case_dir/state/task-x1.pr-poll-merge-notified" ] \
+    || fail "azure-no-python: an unsent completion was recorded as landed"
+  pass "an Azure DevOps completion that is refused, cannot be sent, or never reads completed records nothing as landed"
 }
 
 test_azure_devops_missing_prerequisites_refuse_before_recording() {
