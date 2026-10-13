@@ -116,9 +116,12 @@
 # passed, and a rejected optional policy refuses too. When a still-computing
 # mergeStatus (queued or notSet) is the only failing condition, every
 # condition is re-read after a short bounded wait instead of refusing.
-# Completion is a PATCH of the pull request through `az devops invoke`,
-# because `az repos pr update --status completed` re-reads the source commit
-# itself and cannot bind the head this run verified: the request carries
+# Completion is a PATCH of the pull request's repository-scoped REST location,
+# sent by fm_pr_azure_invoke_location in bin/fm-pr-lib.sh through the
+# azure-devops extension's own client and authentication, because `az repos pr
+# update --status completed` re-reads the source commit itself and cannot bind
+# the head this run verified, and `az devops invoke` resolves a read-only
+# location for that resource name: the request carries
 # lastMergeSourceCommit set to that verified head, so a push that lands in
 # between is not completed unverified, and it squashes unless the caller passes
 # --merge (noFastForward) or --rebase. No other extra argument is accepted, and
@@ -758,11 +761,16 @@ REVIEWS
   AZURE_REPOSITORY_ID=$repository_id
 }
 
+# The Azure DevOps REST location of one pull request addressed through its
+# repository, {project}/_apis/git/repositories/{repositoryId}/pullRequests/{id},
+# the one that accepts PATCH.
+AZURE_PULL_REQUEST_LOCATION=9946fd70-0d40-406e-b686-b4744cbbcc37
+
 # Complete the verified pull request. The PATCH binds lastMergeSourceCommit to
 # the head azure_verify_mergeable verified, so Azure DevOps refuses to complete
 # a source branch that moved after that read.
 azure_complete() {
-  local body rc=0
+  local body routes rc=0
   body=$(mktemp "${TMPDIR:-/tmp}/fm-pr-merge-azure.XXXXXX") || {
     echo "error: could not create the Azure DevOps completion request" >&2
     return 1
@@ -774,9 +782,13 @@ azure_complete() {
     echo "error: could not create the Azure DevOps completion request" >&2
     return 1
   fi
-  fm_pr_azure_run "$FM_PR_AZURE_ORG_URL" devops invoke --area git --resource pullRequests \
-    --route-parameters "project=$AZURE_PROJECT_ID" "repositoryId=$AZURE_REPOSITORY_ID" "pullRequestId=$PR_NUMBER" \
-    --http-method PATCH --in-file "$body" --api-version 7.1 || rc=$?
+  if ! routes=$(jq -cn --arg project "$AZURE_PROJECT_ID" --arg repository "$AZURE_REPOSITORY_ID" \
+    --arg id "$PR_NUMBER" '{project: $project, repositoryId: $repository, pullRequestId: $id}' 2>/dev/null); then
+    rm -f "$body"
+    echo "error: could not create the Azure DevOps completion request" >&2
+    return 1
+  fi
+  fm_pr_azure_invoke_location "$FM_PR_AZURE_ORG_URL" PATCH "$AZURE_PULL_REQUEST_LOCATION" 7.1 "$routes" "$body" || rc=$?
   rm -f "$body"
   if [ "$rc" -ne 0 ]; then
     echo "error: Azure DevOps refused to complete $URL: $FM_PR_AZURE_ERROR" >&2
