@@ -157,12 +157,19 @@
 # trust-only for the same reason as a secondmate home, and bin/fm-live-lab.sh
 # removes the entry again when it tears the lab down.
 #
+# TOPIC-DIR MODE. A topic tab (bin/fm-topic.sh) starts an ordinary Claude
+# session in a project folder the captain named, which is neither a task
+# worktree nor a firstmate home. The evidence is fm-topic.sh check-dir, the one
+# owner of that folder policy: inside a configured workspace root and not in
+# any firstmate home. It is trust-only, like a secondmate home, because no
+# separate primary checkout carries import consent to forward.
+#
 # Only the launching user's own store is written. In worktree mode: the
 # projects entries for the worktree path and the resolved canonical project
 # path in ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json, which must be a regular
 # file this uid owns; every unrelated key and project entry is preserved, and
-# both entries land in one atomic replacement. In secondmate-home and lab-home
-# mode: the single projects entry for the registered home path, same store,
+# both entries land in one atomic replacement. In secondmate-home, lab-home,
+# and topic-dir mode: the single projects entry for the registered home path, same store,
 # same atomic replacement. fm-spawn.sh forwards CLAUDE_CONFIG_DIR onto the
 # claude launch verbatim rather than resolving it, and the pane starts in the
 # registered directory, so only an absolute value names the same store on both sides; a
@@ -188,6 +195,7 @@ usage() {
   echo "usage: fm-claude-trust.sh <worktree> <project>" >&2
   echo "       fm-claude-trust.sh --secondmate-home <home> <id>" >&2
   echo "       fm-claude-trust.sh --lab-home <home>" >&2
+  echo "       fm-claude-trust.sh --topic-dir <dir>" >&2
   exit 2
 }
 
@@ -210,6 +218,14 @@ case "${1:-}" in
     SUB_ID=
     PROJ_ARG=
     SCOPE_NOUN="lab home"
+    ;;
+  --topic-dir)
+    [ "$#" -eq 2 ] || usage
+    MODE=topic-dir
+    TARGET_ARG=$2
+    SUB_ID=
+    PROJ_ARG=
+    SCOPE_NOUN="topic folder"
     ;;
   '' | -h | --help)
     usage
@@ -328,6 +344,9 @@ if [ "$MODE" = worktree ]; then
     [ -n "$CANON_GIT_DIR" ] && [ "$CANON_GIT_DIR" = "$PROJ_COMMON" ] \
       || refuse "project '$PROJ_REAL' is a linked worktree whose primary checkout could not be resolved"
   fi
+elif [ "$MODE" = topic-dir ]; then
+  TOPIC_WHY=$("$(dirname "${BASH_SOURCE[0]}")/fm-topic.sh" check-dir "$TARGET_REAL" 2>&1) \
+    || refuse "${TOPIC_WHY:-$TARGET_REAL is not a folder a topic tab may open in}"
 elif [ "$MODE" = lab-home ]; then
   LAB_MARKER="$TARGET_REAL/$FM_GATE_LAB_MARKER"
   [ ! -L "$LAB_MARKER" ] || refuse "'$LAB_MARKER' is a symlink; a lab home carries the marker as a regular file"

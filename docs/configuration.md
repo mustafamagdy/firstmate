@@ -78,6 +78,7 @@ Each effective `FM_HOME` contains private operational directories.
 - Project and secondmate registries.
 - Captain preferences and optional shared captain preferences.
 - Learnings, backlog, briefs, scout reports, and the optional per-task no-mistakes pipeline-spend ledger.
+- Topic-tab records and result logs under `data/topics/` (`bin/fm-topic.sh`).
 - Explicitly installed content-addressed extension packages under `data/extensions/packages/`.
 
 `state/` holds runtime records:
@@ -507,6 +508,11 @@ The setting is inherited into secondmate homes under the primary-authoritative c
 
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.
 Use the explicit guarded cleanup path described in [`docs/herdr-backend.md`](herdr-backend.md) instead of `herdr server stop`.
+
+### Topic-tab folders
+
+The local `config/topic-roots` file lists the captain's workspace roots, one absolute path per line, that a topic tab may open a project folder inside; without it the only root is `$HOME`.
+[`herdr-backend.md`](herdr-backend.md#topic-tabs) owns the feature and `bin/fm-topic.sh`'s header owns the exact folder policy.
 
 ### Zellij sessions
 

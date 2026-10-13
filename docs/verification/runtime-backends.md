@@ -1205,6 +1205,14 @@ The CLI matrix was checked directly:
 All destructive verification used `bin/fm-herdr-lab.sh` with a non-default `fm-lab-` name and a byte-identical default-session tripwire.
 No ambient `herdr server stop` command is a supported test operation.
 
+### Topic tabs
+
+Verified 2026-10-13 on Linux x86_64 with Herdr 0.9.1 and Claude Code 2.1.285.
+`tests/fm-topic-herdr-e2e.test.sh` passed in a named lab session: `fm-topic.sh open` created one `topic:crm` tab in the calling pane's own unfocused workspace, the stand-in agent reported its topic folder as its working directory, `tab focus` brought that workspace and tab to the front, and a second `open` focused the same tab with the workspace still holding two tabs.
+A real Claude launch through the same path in a lab session reached the composer with no workspace-trust dialog, submitted the starting note as its first prompt, and answered with a topic summary.
+A lab server started from inside another Claude session passed that session's `CLAUDE_CODE_CHILD_SESSION` marker into the tab, and Claude then reported `Transcript saving is off - inherited CLAUDE_CODE_CHILD_SESSION marker`; the generated launcher unsets the parent-session markers, and the repeat run showed no such warning.
+Rerun the lab test after a Herdr or Claude upgrade to refresh this record.
+
 ### fm-remote server birth and login-keychain access
 
 Measured 2026-09-09 on macOS 26 (Darwin 25.6.0) aarch64 with Claude Code 2.1.266 and Herdr 0.9.0, the guarantee behind `bin/fm-remote-herdr-guard.sh` and the doctor's `herdr-server` check: login-keychain access follows the audit session a process was born into, never the launch shape or the shell.
