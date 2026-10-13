@@ -7,13 +7,17 @@
 # session start, never takes or meets this home's session lock, and never
 # supervises, steers, or merges. Work the captain asks for there is handed to
 # this home's inbox with `fm-inbox.sh note "[topic:<topic>] ..."`, and the main
-# firstmate appends each result for that topic to the topic's log with `log`.
+# firstmate appends each result for that topic to the topic's log with `log`,
+# which also rings the live tab so its agent shows the result to the captain.
 # The topic-tabs skill owns when the main firstmate uses each subcommand.
 #
 # Usage:
 #   fm-topic.sh open <topic> <dir> [--context <file>]
 #   fm-topic.sh list
-#   fm-topic.sh log <topic> <text>...   |   log <topic> -   (body from stdin)
+#   fm-topic.sh log <topic> [--done <task>] <text>...   |   ... -   (body from stdin)
+#   fm-topic.sh unseen <topic> [--hook]
+#   fm-topic.sh link <topic> <task>   |   unlink <topic> <task>
+#   fm-topic.sh hint <task>...
 #   fm-topic.sh check-dir <dir>
 #
 # open       Resolve the calling agent's own Herdr workspace from its pane
@@ -26,12 +30,37 @@
 #            that workspace; two such tabs refuse as ambiguous. Reopening a live
 #            topic with a different <dir> refuses rather than moving it.
 #            --context <file> is the starting note shown as the agent's first
-#            context; it is used only when a new tab is created.
+#            context; it is used only when a new tab is created. Reusing a live
+#            tab that has unseen log entries rings it (see Delivery).
 # list       Print one line per recorded topic: topic, dir, tab, created time.
-# log        Append one dated entry to the topic's log, the file the topic tab
-#            reads when the captain asks "what's new".
+# log        Append one dated entry to the topic's log, then ring the topic tab
+#            (see Delivery). Logging succeeds whether or not the ring lands; a
+#            second line reports `delivered:` or `not delivered: <why>`.
+#            --done <task> also unlinks <task> from the topic after logging.
+# unseen     Print the log entries the tab has not shown yet and mark them seen,
+#            under a per-topic lock, so each entry is printed exactly once.
+#            --hook frames them as context for the tab agent, prints nothing
+#            when there are none, and always exits 0: the tab's Claude Code
+#            UserPromptSubmit hook runs it before every prompt.
+# link       Record that <task> (a task id or second mate id in this home)
+#            carries a request from the topic; unlink removes the record.
+# hint       For each given task id linked to a topic, print one TOPIC RESULT
+#            line naming the exact `log` command for that topic.
+#            bin/fm-wake-drain.sh runs it for every task whose new status it
+#            presents, so a result finds its way back to the tab.
 # check-dir  Exit 0 when <dir> may host a topic tab, else print why and exit 1.
 #            bin/fm-claude-trust.sh --topic-dir uses this as its evidence.
+#
+# Delivery: the ring is one short constant doorbell line typed into the tab's
+# recorded pane through bin/fm-backend.sh's Herdr submit path, never the result
+# itself. It is typed only when that pane still belongs to the recorded tab, the
+# tab still carries the topic label, Herdr reports a live agent in it, and its
+# composer does not hold the captain's own half-typed text; otherwise nothing
+# is typed. A busy agent queues the line until its turn ends. The doorbell is a
+# prompt, so the UserPromptSubmit hook injects the unseen entries with it. An
+# entry that was not rung, or whose ring was lost, stays unseen until the hook
+# shows it with the captain's next message in the tab, or a reopened or
+# recreated tab shows it first.
 #
 # Topic names are lowercase letters, digits, dot, dash, or underscore, starting
 # with a letter or digit, at most 40 characters; uppercase input is lowercased.
@@ -46,12 +75,17 @@
 # Durable records live in the home's private data/topics/<topic>/:
 #   topic.meta       key=value: topic, dir, session, workspace_id, tab_id,
 #                    pane_id, label, created_at, updated_at
-#   log.md           results appended by `log`, newest last
+#   log.md           results appended by `log`, newest last, append-only
+#   seen             byte offset into log.md up to which the tab has shown
+#                    entries; absent means none was shown yet
+#   links            task ids carrying a request from this topic, one per line
 #   context.md       the starting note copied from --context, when given
 #   instructions.md  the rendered standing instructions for the topic agent
+#   settings.json    Claude Code settings with the UserPromptSubmit hook
 #   launch.sh        the generated launcher typed into the new tab's shell
 #
-# Only Herdr is supported. Outside a Herdr pane, open refuses and says so.
+# Only Herdr is supported. Outside a Herdr pane, open refuses and says so;
+# log, unseen, link, and hint need no Herdr pane.
 # Claude Code is the topic agent. Its workspace trust is pre-registered through
 # bin/fm-claude-trust.sh --topic-dir before launch, and it runs in the
 # captain's own default permission mode, with no fleet permission flag, exactly
@@ -78,7 +112,10 @@ usage() {
   cat >&2 <<'USAGE'
 usage: fm-topic.sh open <topic> <dir> [--context <file>]
        fm-topic.sh list
-       fm-topic.sh log <topic> <text>... | log <topic> -
+       fm-topic.sh log <topic> [--done <task>] <text>... | log <topic> [--done <task>] -
+       fm-topic.sh unseen <topic> [--hook]
+       fm-topic.sh link <topic> <task> | unlink <topic> <task>
+       fm-topic.sh hint <task>...
        fm-topic.sh check-dir <dir>
 USAGE
   exit 2
@@ -174,11 +211,20 @@ now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # --- Herdr --------------------------------------------------------------------
 
+# backend_load: source the backend dispatch and the Herdr adapter with its
+# composer and process libraries, once.
+backend_load() {
+  [ -z "${TOPIC_BACKEND_LOADED:-}" ] || return 0
+  # shellcheck source=bin/fm-backend.sh
+  . "$FM_CODE_ROOT/bin/fm-backend.sh" || return 1
+  fm_backend_source herdr || return 1
+  TOPIC_BACKEND_LOADED=1
+}
+
 herdr_load() {
   [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ] \
     || die "topic tabs need firstmate running inside a Herdr pane; this session has no Herdr pane identity (other runtimes are not supported)"
-  # shellcheck source=bin/backends/herdr.sh
-  . "$FM_CODE_ROOT/bin/backends/herdr.sh"
+  backend_load || die "could not load the Herdr backend adapter"
   fm_backend_herdr_version_check || exit 1
   SESSION=$(fm_backend_herdr_session)
   fm_backend_herdr_client_select "$SESSION"
@@ -221,6 +267,123 @@ focus_tab() {  # <tab>
   hcli tab focus "$1" >/dev/null || die "could not focus Herdr tab $1"
 }
 
+# --- unseen results and delivery ---------------------------------------------
+
+new_log() {  # <topic> <topic-dir>: create the log and mark its header as seen
+  printf '# %s topic log\n' "$1" > "$2/log.md"
+  file_size "$2/log.md" > "$2/seen"
+}
+
+file_size() { wc -c < "$1" | tr -d '[:space:]'; }
+
+# A per-topic mkdir lock with a bounded wait; a holder that has exited is
+# reclaimed.
+topic_lock() {  # <topic-dir>
+  local lock="$1/.lock" tries=0 holder
+  while ! mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -rf -- "$lock"
+      continue
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -lt 100 ] || return 1
+    sleep 0.1
+  done
+  printf '%s\n' "$$" > "$lock/pid"
+}
+
+topic_unlock() { rm -rf -- "$1/.lock"; }
+
+# The seen offset, or 0 when absent, invalid, or past a replaced log's end.
+seen_offset() {  # <topic-dir> <log-size>
+  local off
+  off=$(cat "$1/seen" 2>/dev/null || true)
+  case "$off" in ''|*[!0-9]*) off=0 ;; esac
+  [ "$off" -le "$2" ] || off=0
+  printf '%s' "$off"
+}
+
+has_unseen() {  # <topic-dir>
+  local size off
+  [ -f "$1/log.md" ] || return 1
+  size=$(file_size "$1/log.md")
+  off=$(seen_offset "$1" "$size")
+  [ "$off" -lt "$size" ] || return 1
+  [ "$off" -gt 0 ] || grep -q '^## ' "$1/log.md"
+}
+
+# take_unseen <topic-dir>: print the unseen entries and advance the seen
+# offset past them, under the topic lock. From offset 0 (no record yet), the
+# log's title is skipped and printing starts at the first entry heading.
+take_unseen() {
+  local tdir=$1 size off chunk
+  [ -f "$tdir/log.md" ] || return 0
+  topic_lock "$tdir" || die "the $tdir lock is held by another process"
+  size=$(file_size "$tdir/log.md")
+  off=$(seen_offset "$tdir" "$size")
+  if [ "$off" -lt "$size" ]; then
+    chunk=$(tail -c "+$((off + 1))" "$tdir/log.md" | head -c "$((size - off))")
+    if [ "$off" -eq 0 ]; then
+      chunk=$(printf '%s\n' "$chunk" | awk 'started || /^## / { started = 1; print }')
+    fi
+    printf '%s\n' "$size" > "$tdir/seen.tmp.$$" && mv -f "$tdir/seen.tmp.$$" "$tdir/seen"
+    chunk=${chunk#"${chunk%%[![:space:]]*}"}
+    [ -z "$chunk" ] || printf '%s\n' "$chunk"
+  fi
+  topic_unlock "$tdir"
+}
+
+doorbell_line() {  # <topic>
+  printf ': New %s topic result from the main firstmate: show the captain your unseen topic results now.' "$1"
+}
+
+# deliver <topic> <topic-dir>: ring the recorded tab once (see Delivery in the
+# header) and print `delivered: ...` or `not delivered: <why>`. Never fails.
+deliver() {
+  local topic=$1 tdir=$2 meta session tab pane out target verdict why=''
+  meta="$tdir/topic.meta"
+  session=$(meta_get "$meta" session)
+  tab=$(meta_get "$meta" tab_id)
+  pane=$(meta_get "$meta" pane_id)
+  if [ -z "$session" ] || [ -z "$tab" ] || [ -z "$pane" ]; then
+    why="no tab is recorded for it"
+  elif ! command -v herdr >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    why="herdr or jq is not installed here"
+  elif ! backend_load >/dev/null 2>&1; then
+    why="the Herdr backend adapter could not be loaded"
+  else
+    fm_backend_herdr_client_select "$session" >/dev/null 2>&1 || true
+    out=$(fm_backend_herdr_cli "$session" pane get "$pane" 2>/dev/null) || out=
+    if ! printf '%s' "$out" | jq -e --arg tab "$tab" '.result.pane.tab_id == $tab' >/dev/null 2>&1; then
+      why="its tab is closed or its pane is gone"
+    elif ! fm_backend_herdr_cli "$session" tab get "$tab" 2>/dev/null \
+        | jq -e --arg label "$(topic_label "$topic")" '.result.tab.label == $label' >/dev/null 2>&1; then
+      why="tab $tab no longer carries the topic label"
+    else
+      target="$session:$pane"
+      if [ "$(fm_backend_agent_state herdr "$target" 2>/dev/null || true)" != alive ]; then
+        why="no live agent is running in the tab"
+      elif [ "$(fm_backend_composer_state herdr "$target" 2>/dev/null || true)" = pending ]; then
+        why="the captain has unsent text in the tab"
+      elif ! verdict=$(fm_backend_send_text_submit herdr "$target" "$(doorbell_line "$topic")" 2 0.4 0.3 2>/dev/null) \
+          || [ "$verdict" = send-failed ]; then
+        why="typing into the tab failed"
+      fi
+    fi
+  fi
+  if [ -z "$why" ]; then
+    printf 'delivered: %s tab %s\n' "$topic" "$tab"
+  else
+    printf 'not delivered: %s; the tab shows the result with the next message there or when the topic is opened again\n' "$why"
+  fi
+}
+
+normalize_task() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] || die "invalid task id '$1'"
+  printf '%s' "$1"
+}
+
 render_instructions() {  # <topic> <dir> <topic-dir> <out>
   local topic=$1 dir=$2 tdir=$3 out=$4
   [ -f "$TEMPLATE" ] || die "missing topic agent template $TEMPLATE"
@@ -236,18 +399,24 @@ render_instructions() {  # <topic> <dir> <topic-dir> <out>
 }
 
 write_launcher() {  # <topic> <dir> <topic-dir>
-  local topic=$1 dir=$2 tdir=$3 prompt claude_bin config_line=
+  local topic=$1 dir=$2 tdir=$3 prompt hook claude_bin config_line=
   claude_bin=${FM_TOPIC_CLAUDE_BIN:-claude}
   if [ -s "$tdir/context.md" ]; then
     prompt="This is the $topic topic tab. Starting note from the main firstmate:
 
 $(cat "$tdir/context.md")
 
-Give the captain a short summary of where the $topic topic stands, then wait for their request."
+Show the captain any unseen topic results first, then give a short summary of where the $topic topic stands, then wait for their request."
   else
-    prompt="This is the $topic topic tab. Read your topic log at $tdir/log.md, give the captain a short summary of where the $topic topic stands, then wait for their request."
+    prompt="This is the $topic topic tab. Show the captain any unseen topic results first, then read your topic log at $tdir/log.md, give a short summary of where the $topic topic stands, then wait for their request."
   fi
   printf '%s\n' "$prompt" > "$tdir/first-prompt.md"
+  # Every prompt, the doorbell included, first runs `unseen --hook`, whose
+  # output Claude Code adds to the agent's context.
+  hook="FM_HOME=$(printf '%q' "$(real_dir "$FM_HOME")") $(printf '%q' "$SELF_DIR/fm-topic.sh") unseen $(printf '%q' "$topic") --hook"
+  jq -n --arg command "$hook" \
+    '{hooks: {UserPromptSubmit: [{hooks: [{type: "command", command: $command}]}]}}' \
+    > "$tdir/settings.json" || die "could not write $tdir/settings.json"
   # The pane's environment comes from the Herdr server, not from this caller,
   # so the Claude store that trust was registered in is pinned explicitly.
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
@@ -267,8 +436,8 @@ Give the captain a short summary of where the $topic topic stands, then wait for
     printf 'unset CLAUDECODE CLAUDE_PID CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ATTENDED CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN\n'
     printf '%s\n' "$config_line"
     printf 'cd %q || exit 1\n' "$dir"
-    printf 'exec %q --name %q --add-dir %q --append-system-prompt "$(cat %q)" "$(cat %q)"\n' \
-      "$claude_bin" "$topic" "$tdir" "$tdir/instructions.md" "$tdir/first-prompt.md"
+    printf 'exec %q --name %q --add-dir %q --settings %q --append-system-prompt "$(cat %q)" "$(cat %q)"\n' \
+      "$claude_bin" "$topic" "$tdir" "$tdir/settings.json" "$tdir/instructions.md" "$tdir/first-prompt.md"
   } > "$tdir/launch.sh"
   chmod 700 "$tdir/launch.sh"
 }
@@ -292,7 +461,7 @@ cmd_open() {
   tdir="$TOPICS/$topic"
   meta="$tdir/topic.meta"
   mkdir -p "$tdir"
-  [ -f "$tdir/log.md" ] || printf '# %s topic log\n' "$topic" > "$tdir/log.md"
+  [ -f "$tdir/log.md" ] || new_log "$topic" "$tdir"
 
   tab=$(find_tab "$topic" "$meta")
   if [ -n "$tab" ]; then
@@ -309,6 +478,7 @@ cmd_open() {
       "created_at=${created:-$(now_utc)}" "updated_at=$(now_utc)"
     printf 'focused: %s tab %s (existing)\n' "$topic" "$tab"
     [ -z "$context" ] || printf 'note: the starting note is used only for a new tab; this one was reused\n'
+    if has_unseen "$tdir"; then deliver "$topic" "$tdir"; fi
     return 0
   fi
 
@@ -349,10 +519,15 @@ cmd_list() {
 }
 
 cmd_log() {
-  local topic tdir body
+  local topic tdir body done_task=''
   [ "$#" -ge 2 ] || usage
   topic=$(normalize_topic "$1")
   shift
+  if [ "$1" = --done ]; then
+    [ "$#" -ge 3 ] || usage
+    done_task=$(normalize_task "$2")
+    shift 2
+  fi
   tdir="$TOPICS/$topic"
   [ -f "$tdir/topic.meta" ] || die "no topic '$topic' is recorded in $TOPICS; open it first"
   if [ "$1" = - ] && [ "$#" -eq 1 ]; then
@@ -361,9 +536,70 @@ cmd_log() {
     body="$*"
   fi
   [ -n "${body//[[:space:]]/}" ] || die "refusing an empty log entry"
-  [ -f "$tdir/log.md" ] || printf '# %s topic log\n' "$topic" > "$tdir/log.md"
+  [ -f "$tdir/log.md" ] || new_log "$topic" "$tdir"
   printf '\n## %s\n\n%s\n' "$(now_utc)" "$body" >> "$tdir/log.md"
   printf 'logged: %s\n' "$topic"
+  [ -z "$done_task" ] || unlink_task "$tdir" "$done_task"
+  deliver "$topic" "$tdir"
+}
+
+cmd_unseen() {
+  local topic tdir hook=0 entries
+  [ "$#" -ge 1 ] || usage
+  [ "$#" -lt 2 ] || { [ "$#" -eq 2 ] && [ "$2" = --hook ] || usage; hook=1; }
+  if [ "$hook" -eq 1 ]; then
+    # A hook must never block or fail the captain's prompt.
+    topic=$(normalize_topic "$1" 2>/dev/null) || exit 0
+    tdir="$TOPICS/$topic"
+    entries=$( (take_unseen "$tdir") 2>/dev/null) || exit 0
+    [ -n "$entries" ] || exit 0
+    printf 'Unseen %s topic results from the main firstmate, newest last. Tell the captain these first, in plain words with any links, before anything else:\n\n%s\n' \
+      "$topic" "$entries"
+    exit 0
+  fi
+  topic=$(normalize_topic "$1")
+  tdir="$TOPICS/$topic"
+  [ -f "$tdir/topic.meta" ] || die "no topic '$topic' is recorded in $TOPICS; open it first"
+  take_unseen "$tdir"
+}
+
+unlink_task() {  # <topic-dir> <task>
+  local tdir=$1 task=$2
+  [ -f "$tdir/links" ] || return 0
+  grep -vxF -- "$task" "$tdir/links" > "$tdir/links.tmp.$$" || true
+  mv -f "$tdir/links.tmp.$$" "$tdir/links"
+}
+
+cmd_link() {  # <link|unlink> <topic> <task>
+  local action=$1 topic tdir task
+  [ "$#" -eq 3 ] || usage
+  topic=$(normalize_topic "$2")
+  task=$(normalize_task "$3")
+  tdir="$TOPICS/$topic"
+  [ -f "$tdir/topic.meta" ] || die "no topic '$topic' is recorded in $TOPICS; open it first"
+  if [ "$action" = link ]; then
+    grep -qxF -- "$task" "$tdir/links" 2>/dev/null || printf '%s\n' "$task" >> "$tdir/links"
+    printf 'linked: %s -> %s\n' "$task" "$topic"
+  else
+    unlink_task "$tdir" "$task"
+    printf 'unlinked: %s from %s\n' "$task" "$topic"
+  fi
+}
+
+cmd_hint() {
+  local task links topic
+  [ "$#" -ge 1 ] || usage
+  [ -d "$TOPICS" ] || return 0
+  for task in "$@"; do
+    [[ "$task" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] || continue
+    for links in "$TOPICS"/*/links; do
+      grep -qxF -- "$task" "$links" 2>/dev/null || continue
+      topic=${links%/links}
+      topic=${topic##*/}
+      printf 'TOPIC RESULT: %s carries a request from the %s topic tab; give that tab each captain-facing outcome too: bin/fm-topic.sh log %s "<outcome>", adding --done %s with the final one.\n' \
+        "$task" "$topic" "$topic" "$task"
+    done
+  done
 }
 
 cmd_check_dir() {
@@ -375,6 +611,9 @@ case "${1:-}" in
   open) shift; cmd_open "$@" ;;
   list) shift; cmd_list "$@" ;;
   log) shift; cmd_log "$@" ;;
+  unseen) shift; cmd_unseen "$@" ;;
+  link|unlink) cmd_link "$@" ;;
+  hint) shift; cmd_hint "$@" ;;
   check-dir) shift; cmd_check_dir "$@" ;;
   -h|--help|help) usage ;;
   *) usage ;;

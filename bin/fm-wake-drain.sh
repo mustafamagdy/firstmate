@@ -5,7 +5,8 @@
 # informational status lines, latest captain-facing statuses not covered by a
 # newer branch outcome, OPEN DECISIONS, captain-call record divergence, and on
 # a supervision-host home the supervision session's new and unprocessed
-# outcomes (BRANCH OUTCOMES), then assert liveness.
+# outcomes (BRANCH OUTCOMES), a TOPIC RESULT reminder for each presented task
+# that carries a topic tab's request, then assert liveness.
 #
 # Keep sequence-bound row consumption independent from generation-bound episode
 # retirement; docs/watcher-continuity.md owns the recovery contract.
@@ -748,6 +749,19 @@ cap_outcome_line() {  # <line> <max-bytes>
   OUTCOME_LINE_BYTES=${#OUTCOME_LINE}
 }
 
+# Print one TOPIC RESULT line for each task presented this drain that carries a
+# request from a topic tab, naming the exact command that gives the tab the
+# outcome; bin/fm-topic.sh owns the links and the line. Silent when no topic is
+# linked, which is the common case, and never fails the presentation.
+print_topic_results_section() {  # <newline-separated-presented-task-ids>
+  local tasks=${1:-} topics
+  [ -n "$tasks" ] || return 0
+  topics="${FM_DATA_OVERRIDE:-$FM_HOME/data}/topics"
+  [ -d "$topics" ] || return 0
+  # shellcheck disable=SC2086 # Task ids are whitespace-free by construction.
+  FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-topic.sh" hint $tasks 2>/dev/null || true
+}
+
 print_status_sections() {
   local snapshot=${1:-} fully_presented=${2:-} acknowledged prepared
   if [ -z "$snapshot" ]; then snapshot=$(status_presentation_snapshot "$STATE") || return 1; fi
@@ -758,7 +772,8 @@ print_status_sections() {
     print_unread_status_section "$snapshot" \
       && print_status_outcome_backstop_section "$snapshot" \
       && print_open_decisions_section "$snapshot" \
-      && print_record_divergence_section
+      && print_record_divergence_section \
+      && print_topic_results_section "$fully_presented"
   } > "$prepared"; then
     rm -f -- "$prepared"
     return 1
