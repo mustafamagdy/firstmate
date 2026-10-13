@@ -467,7 +467,7 @@ test_linked_topic_task_prints_topic_result_reminder() {
   FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" "$DRAIN" > "$out" || fail "drain failed with a linked topic"
 
   grep -F 'TOPIC RESULT: mbg carries a request from the xelta topic tab' "$out" \
-    | grep -F 'bin/fm-topic.sh log xelta "<outcome>", adding --done mbg' >/dev/null \
+    | grep -F 'bin/fm-topic.sh log xelta "<outcome>", adding --decision for a question the captain must answer and --done mbg' >/dev/null \
     || fail "the linked task's outcome did not print its topic log command: $(cat "$out")"
   if grep -F 'crm topic tab' "$out" >/dev/null; then
     fail "a topic linked to another task was named: $(cat "$out")"

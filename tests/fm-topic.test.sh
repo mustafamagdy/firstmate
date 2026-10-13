@@ -3,9 +3,11 @@
 # herdr: create, reuse of an existing tab, label adoption and ambiguity,
 # directory refusals, the generated launcher and its unseen-results hook, the
 # topic log with its seen tracking and skipped deliveries, task links, and the
-# inbox handoff command the topic agent is told to run.
-# tests/fm-topic-herdr-e2e.test.sh proves create, reuse, focus, and doorbell
-# delivery on real Herdr.
+# inbox handoff command the topic agent is told to run, the chat recorded for
+# each tab, resume on reopen with its fallback, and rebinding to the live pane
+# of a refocused or relabeled tab, and decision entries.
+# tests/fm-topic-herdr-e2e.test.sh proves create, reuse, focus, doorbell
+# delivery, resume with its fallback, and rebinding on real Herdr.
 set -euo pipefail
 
 # shellcheck source=tests/lib.sh
@@ -60,13 +62,21 @@ elif cmd == ["pane", "get"]:
         sys.exit(1)
     out({"result": {"pane": p}})
 elif cmd == ["agent", "get"]:
-    print(json.dumps({"error": {"code": "agent_not_found", "message": "no agent"}}))
-    sys.exit(1)
+    chat = st.get("agents", {}).get(args[2])
+    if chat is None:
+        print(json.dumps({"error": {"code": "agent_not_found", "message": "no agent"}}))
+        sys.exit(1)
+    out({"result": {"agent": {"agent": "claude", "agent_status": "unknown", "pane_id": args[2],
+                              "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": chat}}}})
 elif cmd == ["pane", "list"]:
     out({"result": {"panes": [p for p in st["panes"] if p["workspace_id"] == opt("--workspace")]}})
 elif cmd == ["pane", "run"]:
     st["runs"].append({"pane": args[2], "command": args[3]})
     save()
+    if os.environ.get("FAKE_HERDR_EXEC") == "1":
+        import subprocess
+        subprocess.run(["bash", "-c", args[3]], env=dict(os.environ, HERDR_PANE_ID=args[2]),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     out({"result": {"type": "ok"}})
 elif cmd == ["tab", "get"]:
     t = next((t for t in st["tabs"] if t["tab_id"] == args[2]), None)
@@ -84,6 +94,13 @@ elif cmd == ["tab", "create"]:
     st["panes"].append(pane)
     save()
     out({"result": {"tab": tab_obj(tab), "root_pane": pane}})
+elif cmd == ["tab", "rename"]:
+    t = next((t for t in st["tabs"] if t["tab_id"] == args[2]), None)
+    if t is None:
+        sys.exit(1)
+    t["label"] = " ".join(args[3:])
+    save()
+    out({"result": {"tab": tab_obj(t)}})
 elif cmd == ["tab", "focus"]:
     if not any(t["tab_id"] == args[2] for t in st["tabs"]):
         sys.exit(1)
@@ -230,10 +247,12 @@ pass "the generated launcher starts the topic agent with its instructions"
 
 # --- inbox handoff --------------------------------------------------------
 
-handoff=$(grep -F 'bin/fm-inbox.sh note "[topic:xelta]' "$XDIR/instructions.md") \
+handoff=$(grep -F 'bin/fm-inbox.sh note "[topic:xelta] <the request' "$XDIR/instructions.md") \
   || fail "the instructions give the inbox handoff command"
 assert_equals "FM_HOME=$HOME_DIR $ROOT/bin/fm-inbox.sh note \"[topic:xelta] <the request in the captain's words, plus any context you gathered>\"" \
   "$handoff" "the handoff command targets the main home's inbox with the topic tag"
+assert_contains "$(cat "$XDIR/instructions.md")" "FM_HOME=$HOME_DIR $ROOT/bin/fm-inbox.sh note \"[topic:xelta] Decision answer: " \
+  "the tab returns a decision answer to the main home's inbox with the topic tag"
 handoff=${handoff/<the request in the captain*gathered>/fix the render queue}
 FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
   bash -c "$handoff" >/dev/null || fail "the handoff command runs"
@@ -392,7 +411,7 @@ run_topic link crm fm-crm-fix >/dev/null
 assert_equals 1 "$(grep -cx fm-crm-fix "$TDIR/links")" "linking twice records the task once"
 out=$(run_topic hint fm-crm-fix unrelated)
 assert_contains "$out" 'TOPIC RESULT: fm-crm-fix carries a request from the crm topic tab' "a linked task names its topic"
-assert_contains "$out" 'bin/fm-topic.sh log crm "<outcome>", adding --done fm-crm-fix' "the hint names the exact log command"
+assert_contains "$out" 'bin/fm-topic.sh log crm "<outcome>", adding --decision for a question the captain must answer and --done fm-crm-fix' "the hint names the exact log command"
 assert_equals 1 "$(printf '%s\n' "$out" | grep -c 'TOPIC RESULT')" "an unlinked task prints no hint"
 run_topic log crm --done fm-crm-fix "The CRM fix is merged." >/dev/null
 assert_contains "$(cat "$TDIR/log.md")" "The CRM fix is merged." "a final result is logged"
@@ -409,3 +428,203 @@ rc=0
 run_topic open 'bad/name' "$WORK/saas/crm" >/dev/null 2>&1 || rc=$?
 expect_code 1 "$rc" "an invalid topic name is refused"
 pass "invalid topic names are refused"
+
+# --- chat recording, resume, and rebinding --------------------------------
+
+# A token-free Claude stand-in: it registers its chat with the fake Herdr as
+# Herdr's Claude integration does, runs the topic's SessionStart hook with the
+# hook JSON Claude sends, and fails a resume of a chat listed as gone.
+cat > "$FAKEBIN/fake-claude-chat" <<'SH'
+#!/usr/bin/env bash
+settings='' resume=''
+prev=''
+for a in "$@"; do
+  case "$prev" in --settings) settings=$a ;; --resume) resume=$a ;; esac
+  prev=$a
+done
+{ printf 'launch\n'; for a in "$@"; do printf 'arg=%s\n' "$a"; done; } >> "$FAKE_CLAUDE_OUT"
+if [ -n "$resume" ] && [ "$resume" = "${FAKE_CLAUDE_GONE:-}" ]; then
+  echo "No conversation found with session ID: $resume" >&2
+  exit 1
+fi
+chat=${resume:-$FAKE_CLAUDE_NEW_CHAT}
+python3 - "$FAKE_HERDR_STATE" "$HERDR_PANE_ID" "$chat" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1])); st.setdefault("agents", {})[sys.argv[2]] = sys.argv[3]; json.dump(st, open(sys.argv[1], "w"))
+PY
+hook=$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$settings")
+jq -n --arg id "$chat" --arg cwd "$PWD" '{hook_event_name: "SessionStart", source: "startup", session_id: $id, cwd: $cwd}' | bash -c "$hook"
+exit 0
+SH
+chmod +x "$FAKEBIN/fake-claude-chat"
+CHAT1=11111111-1111-4111-8111-111111111111
+CHAT2=22222222-2222-4222-8222-222222222222
+CHAT3=33333333-3333-4333-8333-333333333333
+CLAUDE_LOG="$TMP_ROOT/claude-launches"
+run_chat() {
+  FAKE_HERDR_EXEC=1 FM_TOPIC_CLAUDE_BIN="$FAKEBIN/fake-claude-chat" FAKE_CLAUDE_OUT="$CLAUDE_LOG" \
+    FM_TOPIC_RESUME_WAIT=2 run_topic "$@"
+}
+meta_val() { sed -n "s/^$2=//p" "$HOME_DIR/data/topics/$1/topic.meta"; }
+close_tab() {  # <tab>
+  python3 - "$STATE_JSON" "$1" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+st["tabs"] = [t for t in st["tabs"] if t["tab_id"] != sys.argv[2]]
+st["panes"] = [p for p in st["panes"] if p["tab_id"] != sys.argv[2]]
+json.dump(st, open(sys.argv[1], "w"))
+PY
+}
+
+reset_herdr
+rm -rf "$HOME_DIR/data/topics/crm"
+: > "$CLAUDE_LOG"
+out=$(FAKE_CLAUDE_NEW_CHAT=$CHAT1 run_chat open crm "$WORK/saas/crm" --context "$TMP_ROOT/crm-note.md")
+assert_contains "$out" "new chat: no earlier crm chat is recorded" "a first open says it started a new chat"
+assert_equals "$CHAT1" "$(meta_val crm agent_session)" "the chat that started in the tab is recorded"
+assert_not_contains "$(cat "$CLAUDE_LOG")" "arg=--resume" "a first open does not resume anything"
+pane1=$(meta_val crm pane_id)
+# The SessionStart hook records a chat only from the recorded pane and folder.
+printf '{"session_id":"%s","cwd":"%s"}' "$CHAT3" "$WORK/saas/crm" | HERDR_PANE_ID=w1:p77 FM_HOME="$HOME_DIR" "$TOPIC_BIN" started crm
+printf '{"session_id":"%s","cwd":"%s"}' "$CHAT3" "$WORK/mbg/xelta" | HERDR_PANE_ID="$pane1" FM_HOME="$HOME_DIR" "$TOPIC_BIN" started crm
+out=$(printf 'not json' | HERDR_PANE_ID="$pane1" FM_HOME="$HOME_DIR" "$TOPIC_BIN" started crm; echo "rc=$?")
+assert_equals "rc=0" "$out" "the SessionStart hook is silent and never fails"
+assert_equals "$CHAT1" "$(meta_val crm agent_session)" "a chat from another pane or folder is not recorded"
+pass "the chat started in a topic tab is recorded from its own pane and folder"
+
+# Refocusing reads the tab's chat from Herdr, for example after /clear.
+python3 - "$STATE_JSON" "$pane1" "$CHAT2" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1])); st["agents"][sys.argv[2]] = sys.argv[3]; json.dump(st, open(sys.argv[1], "w"))
+PY
+out=$(run_chat open crm "$WORK/saas/crm")
+assert_contains "$out" "focused: crm tab" "a live tab is refocused"
+assert_equals "$CHAT2" "$(meta_val crm agent_session)" "refocusing records the chat Herdr reports for the tab"
+pass "refocusing a tab records its current chat from Herdr"
+
+# The tab was closed by mistake: reopening resumes the recorded chat.
+close_tab "$(meta_val crm tab_id)"
+: > "$CLAUDE_LOG"
+run_topic log crm "Missed while closed" >/dev/null
+out=$(run_chat open crm "$WORK/saas/crm")
+assert_contains "$out" "opened: crm tab" "a closed tab is reopened"
+assert_contains "$out" "resumed: the last crm chat $CHAT2" "reopening says it resumed the last chat"
+launch=$(cat "$CLAUDE_LOG")
+assert_contains "$launch" $'arg=--resume\narg='"$CHAT2" "the launcher resumes the recorded chat"
+assert_contains "$launch" $'arg=--settings\narg='"$TDIR/settings.json" "the resumed chat keeps the topic hooks"
+assert_contains "$launch" "reopened on this same chat" "the resumed chat gets a short catch-up prompt"
+assert_equals 1 "$(grep -c '^launch$' "$CLAUDE_LOG")" "a successful resume starts no second chat"
+assert_contains "$(run_topic unseen crm --hook)" "Missed while closed" "the result missed while closed reaches the resumed chat's hook"
+assert_not_equals "$pane1" "$(meta_val crm pane_id)" "the record moves to the new pane"
+pass "reopening a closed tab resumes its last chat with the hooks that catch it up"
+
+# The recorded chat is gone: the launcher falls back to a new chat.
+close_tab "$(meta_val crm tab_id)"
+: > "$CLAUDE_LOG"
+out=$(FAKE_CLAUDE_GONE=$CHAT2 FAKE_CLAUDE_NEW_CHAT=$CHAT3 run_chat open crm "$WORK/saas/crm" --context "$TMP_ROOT/crm-note.md")
+assert_contains "$out" "new chat: the last crm chat $CHAT2 could not be resumed" "a failed resume is reported"
+assert_equals 2 "$(grep -c '^launch$' "$CLAUDE_LOG")" "a failed resume launches one new chat"
+fresh=$(awk 'n == 2; /^launch$/ { n++ }' "$CLAUDE_LOG")
+assert_not_contains "$fresh" "arg=--resume" "the fallback chat is a new one"
+assert_contains "$fresh" "CRM: PR https://example.invalid/pr/7 waits for review." "the fallback chat gets the starting note"
+assert_equals "$CHAT3" "$(meta_val crm agent_session)" "the fallback chat is recorded"
+pass "a chat that cannot be resumed falls back to a new chat with the starting note"
+
+# A recorded chat from another folder is never resumed there.
+close_tab "$(meta_val crm tab_id)"
+rm -rf "$HOME_DIR/data/topics/xelta"
+mkdir -p "$HOME_DIR/data/topics/xelta"
+printf 'topic=xelta\ndir=%s\nagent_session=%s\n' "$WORK/saas/crm" "$CHAT1" > "$HOME_DIR/data/topics/xelta/topic.meta"
+: > "$CLAUDE_LOG"
+out=$(FAKE_CLAUDE_NEW_CHAT=$CHAT2 run_chat open xelta "$WORK/mbg/xelta")
+assert_contains "$out" "new chat:" "a chat from another folder starts a new chat"
+assert_not_contains "$(cat "$CLAUDE_LOG")" "arg=--resume" "a chat is never resumed in another folder"
+pass "a chat is resumed only in the folder it ran in"
+
+# Stale pane: the record names a pane that is gone while the tab is live.
+reset_herdr
+rm -rf "$HOME_DIR/data/topics/crm"
+run_topic open crm "$WORK/saas/crm" >/dev/null
+live_pane=$(meta_val crm pane_id)
+sed -i 's/^pane_id=.*/pane_id=w1:p99/' "$TDIR/topic.meta"
+out=$(run_topic log crm "Fifth result")
+assert_contains "$out" "not delivered: no live agent" "log resolves the pane from the live tab instead of a stale pane id"
+assert_equals "$live_pane" "$(meta_val crm pane_id)" "log rebinds the record to the live pane"
+sed -i 's/^pane_id=.*/pane_id=w1:p99/' "$TDIR/topic.meta"
+out=$(run_topic open crm "$WORK/saas/crm")
+assert_contains "$out" "focused: crm tab" "a live tab with a stale pane id is refocused"
+assert_equals "$live_pane" "$(meta_val crm pane_id)" "refocusing rebinds the record to the live pane"
+pass "a stale pane id is replaced by the live tab's pane on open and log"
+
+# Relabeled tab: recognized by its recorded pane, never by name alone.
+tab=$(meta_val crm tab_id)
+python3 - "$STATE_JSON" "$tab" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+for t in st["tabs"]:
+    if t["tab_id"] == sys.argv[2]: t["label"] = "crm"
+json.dump(st, open(sys.argv[1], "w"))
+PY
+out=$(run_topic log crm "Sixth result")
+assert_contains "$out" "not delivered: no live agent" "log recognizes a relabeled tab by its recorded pane"
+assert_equals "topic:crm" "$(herdr_state ".tabs[] | select(.tab_id == \"$tab\") | .label")" "log restores the topic label"
+python3 - "$STATE_JSON" "$tab" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+for t in st["tabs"]:
+    if t["tab_id"] == sys.argv[2]: t["label"] = "crm"
+json.dump(st, open(sys.argv[1], "w"))
+PY
+: > "$CALLS"
+out=$(run_topic open crm "$WORK/saas/crm")
+assert_contains "$out" "focused: crm tab $tab (existing)" "open recognizes a relabeled tab by its recorded pane"
+assert_contains "$out" "restored the tab label topic:crm" "open says it restored the label"
+assert_equals "topic:crm" "$(herdr_state ".tabs[] | select(.tab_id == \"$tab\") | .label")" "open restores the topic label"
+assert_no_grep "tab create" "$CALLS" "a recognized relabeled tab is not duplicated"
+pass "a relabeled tab holding the recorded pane is recognized and relabeled"
+
+# Recognized by its chat: the record's tab and pane ids are stale, but one
+# relabeled tab runs the recorded chat.
+python3 - "$STATE_JSON" "$tab" "$live_pane" "$CHAT1" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+for t in st["tabs"]:
+    if t["tab_id"] == sys.argv[2]: t["label"] = "crm work"
+st["agents"] = {sys.argv[3]: sys.argv[4]}
+json.dump(st, open(sys.argv[1], "w"))
+PY
+sed -i -e 's/^pane_id=.*/pane_id=w1:p99/' -e 's/^tab_id=.*/tab_id=w1:t99/' -e "s/^agent_session=.*/agent_session=$CHAT1/" "$TDIR/topic.meta"
+out=$(run_topic open crm "$WORK/saas/crm")
+assert_contains "$out" "focused: crm tab $tab (existing)" "open recognizes a relabeled tab by the recorded chat"
+assert_equals "$live_pane" "$(meta_val crm pane_id)" "the record is rebound to the pane running the chat"
+pass "a relabeled tab running the recorded chat is recognized"
+
+# A tab merely named like the topic, holding neither the pane nor the chat,
+# is not adopted.
+reset_herdr
+python3 - "$STATE_JSON" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+st["tabs"].append({"tab_id": "w1:t8", "workspace_id": "w1", "label": "crm"})
+st["panes"].append({"pane_id": "w1:p8", "tab_id": "w1:t8", "workspace_id": "w1", "cwd": "/x"})
+st["seq"] = 8
+json.dump(st, open(sys.argv[1], "w"))
+PY
+sed -i -e 's/^pane_id=.*/pane_id=w1:p99/' -e 's/^tab_id=.*/tab_id=w1:t99/' "$TDIR/topic.meta"
+out=$(FM_TOPIC_RESUME_WAIT=0 run_topic open crm "$WORK/saas/crm")
+assert_contains "$out" "opened: crm tab w1:t9" "a tab matching only by name is not adopted"
+assert_equals "crm" "$(herdr_state '.tabs[] | select(.tab_id == "w1:t8") | .label')" "the unrelated tab keeps its name"
+assert_contains "$out" "resuming: the last crm chat $CHAT1" "an unconfirmed resume is reported as still resuming"
+pass "a tab is never recognized by its bare name alone"
+
+# --- decisions asked in the topic tab ---------------------------------------
+
+out=$(run_topic log crm --decision "Merge https://example.invalid/pr/9 now, or wait for the review?")
+assert_contains "$out" "logged: crm" "a decision is logged"
+hook=$(run_topic unseen crm --hook)
+assert_contains "$hook" "ask the captain each one headed Decision needed" "the hook tells the tab to ask decisions"
+assert_contains "$hook" " - Decision needed" "the decision entry is marked"
+assert_contains "$hook" "Merge https://example.invalid/pr/9 now" "the decision text reaches the tab"
+out=$(run_topic log crm --done fm-crm-fix --decision "Ship it?")
+assert_contains "$(tail -n 3 "$TDIR/log.md")" "Decision needed" "--decision combines with --done in any order"
+pass "a decision for the captain is marked so the topic tab asks it"

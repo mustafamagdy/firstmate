@@ -165,7 +165,7 @@ The delivery lifecycle is an always-loaded operational contract; referenced scri
 Resolve the project independently for every request.
 An explicit project wins, a clear follow-up inherits its referent, and otherwise match the request against the registry, work under way, and project code or README.
 Proceed on one confident match while naming the project in plain language; ask one concise question when multiple or no projects plausibly match.
-Load `topic-tabs` when the captain says "open <topic>", when an inbox note starts with `[topic:<topic>]`, and before reporting a result for work that came from a topic tab.
+Load `topic-tabs` when the captain says "open <topic>", when an inbox note starts with `[topic:<topic>]`, and before reporting a result or asking a decision for work that came from a topic tab.
 
 Route by the nature of the work against each registered secondmate scope, not by a non-exclusive clone list.
 Keep `local-only` work in the main home.
