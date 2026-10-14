@@ -6,11 +6,15 @@
 # pane's own workspace, starts the topic agent there in the topic folder, and
 # focuses it; reopening the topic focuses the same tab without creating another;
 # logging a result types the doorbell into the live tab, whose prompt hook then
-# shows the result once; and a result logged while the tab is closed is shown
-# first by the recreated tab.
-# The agent is a token-free stand-in that registers itself with Herdr and runs
-# the topic's prompt hook on its first prompt and on every line it receives, as
-# Claude Code does, so this spends no model tokens.
+# shows the result once; a closed tab reopens on its recorded chat and shows a
+# result logged while it was closed first; a chat that cannot be resumed falls
+# back to a new chat with the starting note; and a renamed tab or a stale pane
+# record is rebound to the live tab and pane.
+# The agent is a token-free stand-in that registers itself with Herdr, runs the
+# topic's SessionStart hook with a chat id, and runs its prompt hook on its
+# first prompt and on every line it receives, as Claude Code does, so this
+# spends no model tokens. A resume of the chat named in $TMP_ROOT/gone-chat
+# fails as a deleted Claude chat does.
 # tests/fm-topic.test.sh covers the refusal and record paths offline.
 #
 # Safety: every Herdr call goes through bin/fm-herdr-lab.sh or carries the lab
@@ -64,17 +68,32 @@ printf '%s\n' "$WORK" > "$HOME_DIR/config/topic-roots"
 printf 'Starting note: one open PR.\n' > "$TMP_ROOT/note.md"
 cat > "$TMP_ROOT/bin/stand-in-agent" <<AGENT
 #!/usr/bin/env python3
-import json, os, subprocess, sys
+import json, os, subprocess, sys, uuid
 args = sys.argv[1:]
+resume = args[args.index("--resume") + 1] if "--resume" in args else ""
+try:
+    gone = open("$TMP_ROOT/gone-chat").read().strip()
+except OSError:
+    gone = ""
+if resume and resume == gone:
+    print("No conversation found with session ID: " + resume, file=sys.stderr, flush=True)
+    sys.exit(1)
+chat = resume or str(uuid.uuid4())
 subprocess.run(["herdr", "pane", "report-agent", "--source", "fm-topic-e2e", "--agent", "stand-in",
-                "--state", "idle", os.environ["HERDR_PANE_ID"], "--session", "$HERDR_LAB_SESSION"],
+                "--state", "idle", "--agent-session-id", chat, os.environ["HERDR_PANE_ID"],
+                "--session", "$HERDR_LAB_SESSION"],
                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 with open(args[args.index("--settings") + 1]) as f:
-    hook = json.load(f)["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+    hooks = json.load(f)["hooks"]
+hook = hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+subprocess.run(["bash", "-c", hooks["SessionStart"][0]["hooks"][0]["command"]],
+               input=json.dumps({"hook_event_name": "SessionStart", "session_id": chat, "cwd": os.getcwd()}),
+               text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def prompt(text):
     print("prompt: " + text.strip(), flush=True)
     print(subprocess.run(["bash", "-c", hook], capture_output=True, text=True).stdout, flush=True)
-print("topic-agent-up name=%s cwd=%s" % (args[1], os.getcwd()), flush=True)
+print("topic-agent-up name=%s cwd=%s chat=%s" % (args[1], os.getcwd(), chat), flush=True)
+print("resumed=%s" % bool(resume), flush=True)
 prompt(args[-1])
 for line in sys.stdin:
     prompt(line)
@@ -101,6 +120,8 @@ run_topic() {
 topic_tabs() { lab tab list --workspace "$MAIN_WS" | jq -r '[.result.tabs[] | select(.label == "topic:crm") | .tab_id] | join(" ")'; }
 focused_tab() { lab tab list --workspace "$MAIN_WS" | jq -r '.result.tabs[] | select(.focused == true) | .tab_id'; }
 focused_ws() { lab workspace list | jq -r '.result.workspaces[] | select(.focused == true) | .workspace_id'; }
+meta_val() { sed -n "s/^$1=//p" "$HOME_DIR/data/topics/crm/topic.meta"; }
+tab_pane() { lab pane list --workspace "$MAIN_WS" | jq -r --arg t "$1" '.result.panes[] | select(.tab_id == $t) | .pane_id'; }
 
 out=$(run_topic open crm "$TOPIC_DIR" --context "$TMP_ROOT/note.md" 2>&1) || fail "open failed: $out"
 TAB=$(topic_tabs)
@@ -115,10 +136,14 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 case "$seen" in
-  *"name=crm cwd=$TOPIC_DIR"*) ;;
+  *"name=crm cwd=$TOPIC_DIR chat="*) ;;
   *) fail "the topic agent did not start in the topic folder (saw: '$seen')" ;;
 esac
-pass "open creates, starts, and focuses a labeled topic tab in the caller's own workspace"
+CHAT=${seen##*chat=}
+CHAT=${CHAT%% *}
+case "$out" in *"new chat: no earlier crm chat is recorded"*) ;; *) fail "a first open did not report a new chat: $out" ;; esac
+[ "$(meta_val agent_session)" = "$CHAT" ] || fail "the tab's chat $CHAT was not recorded (recorded: '$(meta_val agent_session)')"
+pass "open creates, starts, and focuses a labeled topic tab in the caller's own workspace and records its chat"
 
 lab tab focus "$OTHER_TAB" >/dev/null || fail "could not move focus to the other workspace"
 out=$(run_topic open crm "$TOPIC_DIR" 2>&1) || fail "reopen failed: $out"
@@ -149,11 +174,40 @@ lab tab close "$TAB" >/dev/null || fail "could not close the topic tab"
 out=$(run_topic log crm "Second result while the tab was closed" 2>&1) || fail "log with the tab closed failed: $out"
 case "$out" in *"not delivered: its tab is closed or its pane is gone"*) ;; *) fail "log with the tab closed did not report the skip: $out" ;; esac
 out=$(run_topic open crm "$TOPIC_DIR" 2>&1) || fail "reopen after close failed: $out"
+case "$out" in *"resumed: the last crm chat $CHAT"*) ;; *) fail "reopening did not resume the recorded chat: $out" ;; esac
 TAB=$(topic_tabs)
-PANE=$(lab pane list --workspace "$MAIN_WS" | jq -r --arg t "$TAB" '.result.panes[] | select(.tab_id == $t) | .pane_id')
+PANE=$(tab_pane "$TAB")
+pane_shows "$PANE" "resumed=True" || fail "the recreated tab did not resume chat $CHAT"
 pane_shows "$PANE" "Second result while the tab was closed" \
-  || fail "the recreated tab did not show the result logged while it was closed"
-pass "a result logged while the tab is closed is shown first by the recreated tab"
+  || fail "the resumed tab did not show the result logged while it was closed"
+pass "a closed tab reopens on its recorded chat and shows the result it missed first"
+
+lab tab rename "$TAB" crm >/dev/null || fail "could not rename the topic tab"
+out=$(run_topic open crm "$TOPIC_DIR" 2>&1) || fail "open of the renamed tab failed: $out"
+case "$out" in *"focused: crm tab $TAB (existing)"*"restored the tab label topic:crm"*) ;; *) fail "open did not recognize the renamed tab: $out" ;; esac
+[ "$(topic_tabs)" = "$TAB" ] || fail "the renamed tab did not get its topic label back"
+lab tab rename "$TAB" crm >/dev/null || fail "could not rename the topic tab again"
+out=$(run_topic log crm "Third result after a rename" 2>&1) || fail "log after a rename failed: $out"
+case "$out" in *"delivered: crm tab $TAB"*) ;; *) fail "log did not reach the renamed tab: $out" ;; esac
+[ "$(topic_tabs)" = "$TAB" ] || fail "log did not restore the topic label"
+pane_shows "$PANE" "Third result after a rename" || fail "the renamed tab did not show the result"
+sed -i 's/^pane_id=.*/pane_id=gone-pane/' "$HOME_DIR/data/topics/crm/topic.meta"
+out=$(run_topic log crm "Fourth result with a stale pane record" 2>&1) || fail "log with a stale pane failed: $out"
+case "$out" in *"delivered: crm tab $TAB"*) ;; *) fail "log did not reach the live pane: $out" ;; esac
+[ "$(meta_val pane_id)" = "$PANE" ] || fail "log did not rebind the stale pane record to $PANE"
+pane_shows "$PANE" "Fourth result with a stale pane record" || fail "the live pane did not show the result"
+pass "a renamed tab and a stale pane record are rebound to the live tab"
+
+printf '%s\n' "$CHAT" > "$TMP_ROOT/gone-chat"
+lab tab close "$TAB" >/dev/null || fail "could not close the topic tab"
+out=$(run_topic open crm "$TOPIC_DIR" --context "$TMP_ROOT/note.md" 2>&1) || fail "reopen of a gone chat failed: $out"
+case "$out" in *"new chat: the last crm chat $CHAT could not be resumed"*) ;; *) fail "a failed resume was not reported: $out" ;; esac
+TAB=$(topic_tabs)
+PANE=$(tab_pane "$TAB")
+pane_shows "$PANE" "resumed=False" || fail "the fallback did not start a new chat"
+pane_shows "$PANE" "Starting note: one open PR." || fail "the fallback chat did not get the starting note"
+[ "$(meta_val agent_session)" != "$CHAT" ] || fail "the fallback chat was not recorded"
+pass "a chat that cannot be resumed falls back to a new chat with the starting note"
 
 cleanup_all || { printf 'not ok - lab teardown or default-session tripwire failed\n' >&2; exit 1; }
 pass "lab torn down with the default session unchanged"
