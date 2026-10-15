@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Present durable watcher wake records, retire rows no actor could ever consume,
-# optionally acknowledge handled records,
+# optionally acknowledge handled records with their per-row receipt fragments,
 # annotate every unread line for validated signal status keys, surface unread
 # informational status lines, latest captain-facing statuses not covered by a
 # newer branch outcome, OPEN DECISIONS, captain-call record divergence, and on
@@ -8,13 +8,28 @@
 # outcomes (BRANCH OUTCOMES), a TOPIC RESULT reminder for each presented task
 # that carries a topic tab's request, then assert liveness.
 #
+# Usage: fm-wake-drain.sh [--ack-through SEQUENCE --recovery-generation GENERATION
+#                         --receipt SEQ:FRAGMENT,SEQ:FRAGMENT,...]
+# Presentation appends a sixth tab-separated field, wake-receipt=SEQ:FRAGMENT,
+# to each complete queue row, after all status/outcome sections. Join these
+# values with commas for --receipt (use none for an empty presentation).
+# The final WAKE_ACK_REQUIRED line names the row count and sequences, but never
+# contains their fragments. Read full, unfiltered output before handling it.
+# Receipts are actor-local and replaced on each successful presentation; stale,
+# missing, or incorrect fragments refuse the entire acknowledgement and name
+# unpresented sequences. An unchanged receipt can be retried idempotently.
+# Receipt validation precedes every acknowledgement side effect. A receipt
+# establishes possession of the complete row, not that a human understood it.
+#
 # Keep sequence-bound row consumption independent from generation-bound episode
 # retirement; docs/watcher-continuity.md owns the recovery contract.
 # Every scratch file this script mints (.main-eligible-rows.tmp.*,
 # .wake-rows.consume.*, .wake-queue.retire.*, .wake-queue.ack.*,
-# .wake-queue.actor-view.*) is created and removed under the queue lock, so one
-# found while taking that lock was left by a drain that died mid-write; each
-# locked drain rotates such leftovers away before doing anything else.
+# .wake-queue.actor-view.*, .wake-presentation.tmp.*) is created and removed
+# under the queue lock, so one found while taking that lock was left by a drain
+# that died mid-write; each locked drain rotates such leftovers away.
+# Ack snapshots cross the unlocked receipt phase, so only a dead owner's
+# .wake-ack-rows.<pid>.* files may be rotated.
 # FM_STATUS_PRESENTATION_LOCK_TIMEOUT sets the positive whole-second wait for
 # presentation-path locks (default 10); queue mutation locks remain blocking.
 set -u
@@ -37,6 +52,7 @@ SCRIPT_DIR="$(d=${BASH_SOURCE[0]%/*}; [ "$d" != "${BASH_SOURCE[0]}" ] || d=.; cd
 
 DRAIN_TMP=
 DRAIN_VIEW_TMP=
+ACK_ROWS_TMP=
 DRAIN_LOCK_HELD=false
 RAW_ROWS=
 RECOVERY_MARKER="$STATE/.watcher-down"
@@ -45,6 +61,7 @@ RECOVERY_ACK_REQUIRED=false
 RECOVERY_ACK_MOVED=false
 ACK_THROUGH=
 ACK_GENERATION=
+ACK_RECEIPT=
 ACK_REMOVED=0
 PRESENTED_MAX=0
 ACK_FINGERPRINTS=
@@ -84,10 +101,20 @@ rows_file_valid() { fm_wake_grant_rows_valid "$1"; }
 
 # rotate_scratch_locked: remove scratch a dead drain left behind (header).
 rotate_scratch_locked() {
-  local scratch
+  local scratch owner
   for scratch in "$STATE"/.main-eligible-rows.tmp.* "$STATE"/.wake-rows.consume.* \
-    "$STATE"/.wake-queue.retire.* "$STATE"/.wake-queue.ack.* "$STATE"/.wake-queue.actor-view.*; do
+    "$STATE"/.wake-queue.retire.* "$STATE"/.wake-queue.ack.* "$STATE"/.wake-queue.actor-view.* \
+    "$STATE"/.wake-presentation.tmp.*; do
     [ -e "$scratch" ] || [ -L "$scratch" ] || continue
+    rm -f -- "$scratch"
+  done
+  # Ack snapshots survive the unlocked inactive-receipt phase. Reap only
+  # snapshots whose creating process is gone, never another active ack's.
+  for scratch in "$STATE"/.wake-ack-rows.*; do
+    [ -e "$scratch" ] || continue
+    owner=${scratch##*/.wake-ack-rows.}
+    owner=${owner%%.*}
+    fm_pid_alive "$owner" && continue
     rm -f -- "$scratch"
   done
 }
@@ -205,11 +232,8 @@ require_branch_eligible_rows() {
   }
 }
 
-# The highest sequence this actor has already been presented: the branch's
-# grant is exactly its current prompt's rows, and main's claim file is what its
-# last drain printed. Read BEFORE an ack re-claims, so a row that arrived since
-# presentation is never named as "the current wake" the caller may acknowledge
-# unseen. 0 when nothing is on record.
+# Highest actor-owned sequence, for diagnostics only. Claims establish
+# ownership; validate_receipt_locked owns the presentation proof.
 presented_max_row() { # <rows-file>
   if rows_file_valid "$1" 2>/dev/null; then
     awk '$1 ~ /^[0-9]+$/ && $1 > max { max=$1 } END { print max + 0 }' "$1"
@@ -218,21 +242,139 @@ presented_max_row() { # <rows-file>
   fi
 }
 
-case "${1:-}" in
-  '') ;;
-  --ack-through)
-    ACK_THROUGH=${2:-}
-    case "$ACK_THROUGH" in ''|*[!0-9]*) echo "wake drain: invalid acknowledgement sequence" >&2; exit 2 ;; esac
-    [ "${3:-}" = --recovery-generation ] \
-      || { echo "wake drain: acknowledgement requires its recovery generation" >&2; exit 2; }
-    ACK_GENERATION=${4:-}
-    case "$ACK_GENERATION" in ''|*[!A-Za-z0-9._-]*) echo "wake drain: invalid recovery generation" >&2; exit 2 ;; esac
-    [ "$#" -eq 4 ] || { echo "wake drain: unexpected acknowledgement arguments" >&2; exit 2; }
-    ;;
-  *) echo "usage: fm-wake-drain.sh [--ack-through SEQUENCE --recovery-generation GENERATION]" >&2; exit 2 ;;
-esac
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --ack-through) ACK_THROUGH=${2:-} ;;
+    --recovery-generation) ACK_GENERATION=${2:-} ;;
+    --receipt) ACK_RECEIPT=${2:-} ;;
+    *) echo "wake drain: unexpected argument: $1" >&2; exit 2 ;;
+  esac
+  [ "$#" -ge 2 ] || { echo "wake drain: missing argument for $1" >&2; exit 2; }
+  shift 2
+done
+if [ -n "$ACK_THROUGH$ACK_GENERATION$ACK_RECEIPT" ]; then
+  case "$ACK_THROUGH" in ''|*[!0-9]*) echo "wake drain: invalid acknowledgement sequence" >&2; exit 2 ;; esac
+  case "$ACK_GENERATION" in ''|*[!A-Za-z0-9._-]*) echo "wake drain: acknowledgement requires its recovery generation" >&2; exit 2 ;; esac
+fi
 
-[ "$ACTOR" != branch ] || require_branch_eligible_rows || exit 1
+RECEIPT_FILE="$STATE/.wake-presentation-$ACTOR"
+
+# Validate possession of every complete actor-owned row before any receipt,
+# queue, or recovery acknowledgement. Claim files alone prove ownership, not
+# presentation. Keep the manifest after success for idempotent retries.
+validate_receipt_locked() {
+  local rows missing header generation cutoff extra valid_receipt=yes
+  if [ "$ACTOR" = branch ] && { [ -e "$ELIGIBLE_ROWS_FILE" ] || [ -L "$ELIGIBLE_ROWS_FILE" ]; }; then
+    require_branch_eligible_rows || return 1
+  fi
+  rows=$MAIN_ROWS_FILE
+  [ "$ACTOR" != branch ] || rows=$ELIGIBLE_ROWS_FILE
+  header=''
+  if [ -f "$RECEIPT_FILE" ] && [ ! -L "$RECEIPT_FILE" ]; then
+    header=$(head -n 1 "$RECEIPT_FILE" 2>/dev/null) || header=''
+  fi
+  IFS=$(printf '\t') read -r generation cutoff extra <<EOF
+$header
+EOF
+  case "$cutoff" in ''|*[!0-9]*) cutoff=0; valid_receipt=no ;; esac
+  # Reject fabricated or stale fragments even on an already-consumed queue.
+  awk -F '\t' -v receipt="$ACK_RECEIPT" '
+    NR>1 { token=$NF; sub(/^wake-receipt=/, "", token); expected[token]=1; rows++ }
+    END {
+      if (!rows) exit receipt!="none"
+      n=split(receipt, pieces, ",")
+      for (i=1; i<=n; i++) if (!(pieces[i] in expected)) exit 1
+    }
+  ' "$RECEIPT_FILE" 2>/dev/null || valid_receipt=no
+  missing=$(awk -F '\t' -v actor="$ACTOR" -v cutoff="$ACK_THROUGH" \
+    -v grant="$ELIGIBLE_ROWS_FILE" -v owned="$rows" -v manifest="$RECEIPT_FILE" \
+    -v receipt="$ACK_RECEIPT" -v valid="$([ "$generation" = "$ACK_GENERATION" ] && printf yes)" '
+    BEGIN {
+      n=split(receipt, pieces, ","); for (i=1; i<=n; i++) seen[pieces[i]]=1
+      while ((getline line < grant)>0) reserved[line]=1
+      close(grant)
+      while ((getline line < owned)>0) claimed[line]=1
+      while ((getline line < manifest)>0) {
+        count=split(line, fields, "\t")
+        if (count >= 6) {
+          original=line; sub(/\twake-receipt=[^\t]*$/, "", original)
+          token=fields[count]; sub(/^wake-receipt=/, "", token)
+          shown[original]=token
+          seq=fields[2]
+          if (!(seq in ordered)) { order[++total]=seq; ordered[seq]=1 }
+          if (seq+0<=cutoff+0 && (valid!="yes" || !(token in seen))) absent[seq]=1
+        }
+      }
+    }
+    NF>=5 && $2 ~ /^[0-9]+$/ && $2+0<=cutoff+0 {
+      if (actor=="branch" && !($2 in claimed)) {
+        if ($0 in shown) absent[$2]=1
+        next
+      }
+      if (actor=="main" && ($2 in reserved)) next
+      if (valid!="yes" || !($0 in shown) || !(shown[$0] in seen)) {
+        absent[$2]=1
+        if (!($2 in ordered)) { order[++total]=$2; ordered[$2]=1 }
+      }
+    }
+    END {
+      for (i=1; i<=total; i++) if (order[i] in absent) printf "%s%s", (bad++ ? "," : ""), order[i]
+    }
+  ' "$FM_WAKE_QUEUE") || return 1
+  if [ -n "$missing" ] || [ "$generation" != "$ACK_GENERATION" ] \
+    || [ -z "$cutoff" ] || [ "$ACK_THROUGH" -gt "${cutoff:-0}" ] \
+    || [ -z "$ACK_RECEIPT" ] || [ "$valid_receipt" != yes ]; then
+    printf 'wake drain: acknowledgement refused; unpresented seqs: %s; missing, wrong, or stale --receipt. Re-run bin/fm-wake-drain.sh and collect fragments from every full row.\n' \
+      "${missing:-none (presentation boundary or receipt is stale)}" >&2
+    return 1
+  fi
+}
+
+print_receipt_command() { # <cutoff> <generation> <comma-separated-seqs> <count>
+  printf 'WAKE_ACK_REQUIRED: %s row(s), seqs [%s]; join wake-receipt values from every full row with commas as RECEIPTS (none for zero rows); after handling run bin/fm-wake-drain.sh --receipt RECEIPTS --ack-through %s --recovery-generation %s\n' \
+    "$4" "$3" "$1" "$2" >&2
+}
+
+# Called under the queue lock after all long sections have been presented.
+# Each fragment is independent and appears only on its corresponding row.
+print_receipted_rows_locked() {
+  local prepared nonce seqs count header row presentation_ok=true
+  prepared=$(mktemp "$STATE/.wake-presentation.tmp.XXXXXX") || return 1
+  nonce=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n') || { rm -f "$prepared"; return 1; }
+  [ "${#nonce}" -eq 64 ] || {
+    rm -f "$prepared"
+    echo "wake drain: could not obtain randomness for presentation receipts" >&2
+    return 1
+  }
+  if ! {
+    printf '%s\t%s\n' "${RECOVERY_MARKER_TOKEN##*:}" "$ACK_THROUGH"
+    printf '%s\n' "$RAW_ROWS" | perl -MDigest::SHA=sha256_hex -e '
+      my $nonce=shift;
+      while (<STDIN>) {
+        chomp; next unless length;
+        my @fields=split /\t/;
+        my $fragment=substr(sha256_hex($nonce . "\0" . $_), 0, 24);
+        print "$_\twake-receipt=$fields[1]:$fragment\n" or exit 1;
+      }
+    ' "$nonce"
+  } > "$prepared"; then rm -f "$prepared"; return 1; fi
+  chmod 0600 "$prepared" || { rm -f "$prepared"; return 1; }
+  if ! {
+    IFS= read -r header && while IFS= read -r row; do
+      if ! fm_wake_print_inbox_details "$row" || ! printf '%s\n' "$row"; then
+        presentation_ok=false
+        break
+      fi
+    done
+  } < "$prepared"; then presentation_ok=false; fi
+  if [ "$presentation_ok" != true ]; then rm -f "$prepared"; return 1; fi
+  _fm_atomic_replace "$prepared" "$RECEIPT_FILE" || { rm -f "$prepared"; return 1; }
+  seqs=$(printf '%s\n' "$RAW_ROWS" | awk -F '\t' 'NF>=5 { printf "%s%s", (n++ ? "," : ""), $2 }')
+  count=$(printf '%s\n' "$RAW_ROWS" | awk -F '\t' 'NF>=5 { n++ } END { print n+0 }')
+  print_receipt_command "$ACK_THROUGH" "${RECOVERY_MARKER_TOKEN##*:}" "$seqs" "$count"
+}
+
+[ "$ACTOR" != branch ] || [ -n "$ACK_THROUGH" ] || require_branch_eligible_rows || exit 1
 
 # Defense in depth for the supervision chain: this script runs at the top of
 # every wake-handling and recovery turn, so assert supervision health here too. A
@@ -824,11 +966,31 @@ print_status_presentation() {  # [<deduped-raw-rows>]
   return "$rc"
 }
 
+# Presentation waits stay bounded even when the queue is reacquired after
+# enrichment; acknowledgement mutation waits retain their blocking contract.
+lock_queue_for_presentation() {
+  local lock_rc
+  if fm_lock_acquire_wait_bounded "$FM_WAKE_QUEUE_LOCK" "$PRESENTATION_LOCK_TIMEOUT"; then
+    DRAIN_LOCK_HELD=true
+    return 0
+  else
+    lock_rc=$?
+  fi
+  if [ "$lock_rc" -eq 124 ]; then
+    printf 'WAKE DRAIN SKIPPED: queue lock remains held by live pid %s after %ss; retry on the next drain.\n' \
+      "${FM_LOCK_HELD_PID:-unknown}" "$PRESENTATION_LOCK_TIMEOUT"
+    exit "$BRANCH_OUTCOMES_RC"
+  fi
+  printf 'wake drain: queue lock could not be acquired safely\n' >&2
+  exit 1
+}
+
 # shellcheck disable=SC2317,SC2329 # Invoked by trap handlers below.
 cleanup() {
   local status=$?
   [ -z "$DRAIN_TMP" ] || rm -f -- "$DRAIN_TMP" 2>/dev/null || true
   [ -z "$DRAIN_VIEW_TMP" ] || rm -f -- "$DRAIN_VIEW_TMP" 2>/dev/null || true
+  [ -z "$ACK_ROWS_TMP" ] || rm -f -- "$ACK_ROWS_TMP" 2>/dev/null || true
   if [ "$DRAIN_LOCK_HELD" = true ]; then
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   fi
@@ -841,40 +1003,33 @@ trap 'exit 143' TERM
 
 if [ -n "$ACK_THROUGH" ]; then
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
-elif fm_lock_acquire_wait_bounded "$FM_WAKE_QUEUE_LOCK" "$PRESENTATION_LOCK_TIMEOUT"; then
-  :
 else
-  lock_rc=$?
-  if [ "$lock_rc" -eq 124 ]; then
-    printf 'WAKE DRAIN SKIPPED: queue lock remains held by live pid %s after %ss; retry on the next drain.\n' \
-      "${FM_LOCK_HELD_PID:-unknown}" "$PRESENTATION_LOCK_TIMEOUT"
-    exit 0
-  fi
-  printf 'wake drain: queue lock could not be acquired safely\n' >&2
-  exit 1
+  lock_queue_for_presentation
 fi
 DRAIN_LOCK_HELD=true
+if [ -n "$ACK_THROUGH" ]; then
+  validate_receipt_locked || exit 1
+fi
 rotate_scratch_locked
+if [ -n "$ACK_THROUGH" ]; then
+  fm_current_pid ACK_OWNER_PID || exit 1
+  ACK_ROWS_TMP=$(mktemp "$STATE/.wake-ack-rows.$ACK_OWNER_PID.XXXXXX") || exit 1
+  ACK_ACTOR_ROWS=$MAIN_ROWS_FILE
+  [ "$ACTOR" != branch ] || ACK_ACTOR_ROWS=$ELIGIBLE_ROWS_FILE
+  awk -F '\t' -v cutoff="$ACK_THROUGH" -v claims="$ACK_ACTOR_ROWS" '
+    BEGIN { while ((getline line < claims)>0) claimed[line]=1 }
+    NR>1 && $2+0<=cutoff+0 && ($2 in claimed) { print $2 }
+  ' "$RECEIPT_FILE" > "$ACK_ROWS_TMP" || exit 1
+fi
 reclaim_stale_branch_grant_locked || exit 1
 [ "$ACTOR" != main ] || retire_unconsumable_rows_locked
-[ "$ACTOR" != branch ] || require_branch_eligible_rows || exit 1
+[ "$ACTOR" != branch ] || [ -n "$ACK_THROUGH" ] || require_branch_eligible_rows || exit 1
 
 if [ -n "$ACK_THROUGH" ]; then
   if [ "$ACTOR" = branch ]; then
     PRESENTED_MAX=$(presented_max_row "$ELIGIBLE_ROWS_FILE") || exit 1
   else
     PRESENTED_MAX=$(presented_max_row "$MAIN_ROWS_FILE") || exit 1
-  fi
-  if [ "$ACTOR" = main ]; then
-    # Preserve main's original whole-cutoff acknowledgement contract: a direct
-    # or replayed main ack still owns every unreserved row through its cutoff,
-    # so claim those again under the queue lock and none is stranded merely
-    # because it was not present during the earlier drain. A row above the
-    # cutoff arrived after presentation and was never shown to main, so it
-    # stays unowned for whichever actor presents it next; claiming it here
-    # would hand every later away-session wake back to main. A live branch
-    # grant remains excluded by claim_main_rows_locked.
-    claim_main_rows_locked "$ACK_THROUGH" || exit 1
   fi
   if [ "$ACTOR" = branch ]; then
     # An away-posture grant can name check-kind rows - the attended
@@ -884,16 +1039,16 @@ if [ -n "$ACK_THROUGH" ]; then
     # sequences it consumes. Otherwise the receipt stays pending and every
     # later reconcile scan re-queues the same fingerprint. Attended, a grant
     # names no check row and both scans find nothing.
-    ACK_FINGERPRINTS=$(inactive_outcome_fingerprints "$ACK_THROUGH" 'inactive-outcome:' "$ELIGIBLE_ROWS_FILE") || exit 1
-    ACK_NOTICE_FINGERPRINTS=$(inactive_outcome_fingerprints "$ACK_THROUGH" 'inactive-reconcile:' "$ELIGIBLE_ROWS_FILE") || exit 1
+    ACK_FINGERPRINTS=$(inactive_outcome_fingerprints "$ACK_THROUGH" 'inactive-outcome:' "$ACK_ROWS_TMP") || exit 1
+    ACK_NOTICE_FINGERPRINTS=$(inactive_outcome_fingerprints "$ACK_THROUGH" 'inactive-reconcile:' "$ACK_ROWS_TMP") || exit 1
   else
     if { [ -e "$MAIN_ROWS_FILE" ] || [ -L "$MAIN_ROWS_FILE" ]; } \
       && ! rows_file_valid "$MAIN_ROWS_FILE"; then
       echo "wake drain: main acknowledgement has an invalid presented-row claim" >&2
       exit 1
     fi
-    ACK_FINGERPRINTS=$(inactive_outcome_fingerprints "$ACK_THROUGH" 'inactive-outcome:' "$MAIN_ROWS_FILE") || exit 1
-    ACK_NOTICE_FINGERPRINTS=$(inactive_outcome_fingerprints "$ACK_THROUGH" 'inactive-reconcile:' "$MAIN_ROWS_FILE") || exit 1
+    ACK_FINGERPRINTS=$(inactive_outcome_fingerprints "$ACK_THROUGH" 'inactive-outcome:' "$ACK_ROWS_TMP") || exit 1
+    ACK_NOTICE_FINGERPRINTS=$(inactive_outcome_fingerprints "$ACK_THROUGH" 'inactive-reconcile:' "$ACK_ROWS_TMP") || exit 1
   fi
   fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   DRAIN_LOCK_HELD=false
@@ -907,24 +1062,24 @@ if [ -n "$ACK_THROUGH" ]; then
   DRAIN_TMP=$(mktemp "$STATE/.wake-queue.ack.XXXXXX") || exit 1
   chmod 0600 "$DRAIN_TMP" || exit 1
   if [ "$ACTOR" = branch ]; then
-    require_branch_eligible_rows || exit 1
+    if [ -s "$ACK_ROWS_TMP" ]; then require_branch_eligible_rows || exit 1; fi
     # Delete a row only when its sequence is <= cutoff AND it is named in the
     # extension's eligible snapshot; every other row - including one whose
     # sequence is below cutoff but not in the snapshot - is kept untouched.
-    awk -F '\t' -v cutoff="$ACK_THROUGH" -v seqs="$ELIGIBLE_ROWS_FILE" '
+    awk -F '\t' -v cutoff="$ACK_THROUGH" -v seqs="$ACK_ROWS_TMP" '
       BEGIN { while ((getline line < seqs) > 0) if (line ~ /^[0-9]+$/) keep[line] = 1 }
       NF < 5 || $2 !~ /^[0-9]+$/ || $2 > cutoff || !($2 in keep) { print }
     ' "$FM_WAKE_QUEUE" > "$DRAIN_TMP" || exit 1
-    fm_wake_commit_secondmate_stall_receipts_through "$ACK_THROUGH" "$ELIGIBLE_ROWS_FILE" || {
+    fm_wake_commit_secondmate_stall_receipts_through "$ACK_THROUGH" "$ACK_ROWS_TMP" || {
       echo "wake drain: secondmate stall receipt could not be recorded safely" >&2
       exit 1
     }
   else
-    awk -F '\t' -v cutoff="$ACK_THROUGH" -v seqs="$MAIN_ROWS_FILE" '
+    awk -F '\t' -v cutoff="$ACK_THROUGH" -v seqs="$ACK_ROWS_TMP" '
       BEGIN { while ((getline line < seqs) > 0) owned[line]=1 }
       NF < 5 || $2 !~ /^[0-9]+$/ || $2 > cutoff || !($2 in owned) { print }
     ' "$FM_WAKE_QUEUE" > "$DRAIN_TMP" || exit 1
-    fm_wake_commit_secondmate_stall_receipts_through "$ACK_THROUGH" "$MAIN_ROWS_FILE" || {
+    fm_wake_commit_secondmate_stall_receipts_through "$ACK_THROUGH" "$ACK_ROWS_TMP" || {
       echo "wake drain: secondmate stall receipt could not be recorded safely" >&2
       exit 1
     }
@@ -968,16 +1123,8 @@ if [ -n "$ACK_THROUGH" ]; then
     # re-presents the same row and invites the same stale acknowledgement).
     # The generation is the marker's current one; only a retired marker cannot
     # be named because the next drain opens a fresh generation for it.
-    case "$RECOVERY_MARKER_TOKEN" in
-      pending:*|announced:*)
-        printf 'wake drain: nothing was acknowledged through %s (none of your presented wake rows is at or below it); the current wake is row %s: run bin/fm-wake-drain.sh --ack-through %s --recovery-generation %s after handling it\n' \
-          "$ACK_THROUGH" "$PRESENTED_MAX" "$PRESENTED_MAX" "${RECOVERY_MARKER_TOKEN##*:}" >&2
-        ;;
-      *)
-        printf 'wake drain: nothing was acknowledged through %s (none of your presented wake rows is at or below it); the current wake is row %s: re-run bin/fm-wake-drain.sh and use the WAKE_ACK_REQUIRED command it prints\n' \
-          "$ACK_THROUGH" "$PRESENTED_MAX" >&2
-        ;;
-    esac
+    printf 'wake drain: nothing was acknowledged through %s; the current wake is row %s: re-run bin/fm-wake-drain.sh and use the new WAKE_ACK_REQUIRED instructions\n' \
+      "$ACK_THROUGH" "$PRESENTED_MAX" >&2
   elif [ "$RECOVERY_ACK_MOVED" = true ]; then
     printf 'wake drain: acknowledged wakes through %s (%s row(s) consumed), but a newer recovery episode is pending; re-run bin/fm-wake-drain.sh and use the new WAKE_ACK_REQUIRED command\n' \
       "$ACK_THROUGH" "$ACK_REMOVED" >&2
@@ -1005,7 +1152,12 @@ if [ ! -s "$FM_WAKE_QUEUE" ]; then
   (print_status_presentation) || true
   print_branch_outcomes_section || BRANCH_OUTCOMES_RC=1
   if [ "$RECOVERY_ACK_REQUIRED" = true ]; then
-    printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 0 --recovery-generation %s\n' "${RECOVERY_MARKER_TOKEN##*:}" >&2
+    lock_queue_for_presentation
+    ACK_THROUGH=0
+    RAW_ROWS=
+    print_receipted_rows_locked || exit 1
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    DRAIN_LOCK_HELD=false
   fi
   assert_watcher_liveness
   exit "$BRANCH_OUTCOMES_RC"
@@ -1064,7 +1216,7 @@ awk -F '\t' -v seqs="$ACTOR_ROWS_FILE" '
   BEGIN { while ((getline line < seqs) > 0) keep[line]=1 }
   NF >= 5 && ($2 in keep)
 ' "$FM_WAKE_QUEUE" > "$DRAIN_VIEW_TMP" || exit 1
-RAW_ROWS=$(fm_wake_print_deduped "$DRAIN_VIEW_TMP") || exit "$?"
+RAW_ROWS=$(cat "$DRAIN_VIEW_TMP") || exit "$?"
 rm -f -- "$DRAIN_VIEW_TMP" || exit 1
 DRAIN_VIEW_TMP=
 ACK_THROUGH=$(printf '%s\n' "$RAW_ROWS" | awk -F '\t' '$2 ~ /^[0-9]+$/ && $2 > max { max=$2 } END { print max + 0 }') || exit 1
@@ -1073,9 +1225,6 @@ case "${FM_WAKE_DRAIN_TEST_DELAY_BEFORE_COMMIT:-0}" in
   ''|*[!0-9]*) ;;
   *) sleep "$FM_WAKE_DRAIN_TEST_DELAY_BEFORE_COMMIT" ;;
 esac
-if [ -n "$RAW_ROWS" ]; then
-  printf '%s\n' "$RAW_ROWS" || exit "$?"
-fi
 fm_recovery_marker_snapshot "$RECOVERY_MARKER" || exit 1
 RECOVERY_MARKER_TOKEN=$FM_RECOVERY_MARKER_TOKEN
 case "$RECOVERY_MARKER_TOKEN" in
@@ -1084,10 +1233,11 @@ case "$RECOVERY_MARKER_TOKEN" in
 esac
 fm_lock_release "$FM_WAKE_QUEUE_LOCK"
 DRAIN_LOCK_HELD=false
-printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through %s --recovery-generation %s\n' \
-  "$ACK_THROUGH" "${RECOVERY_MARKER_TOKEN##*:}" >&2
-
 (print_status_presentation "$RAW_ROWS") || true
 print_branch_outcomes_section || BRANCH_OUTCOMES_RC=1
 assert_watcher_liveness
+lock_queue_for_presentation
+print_receipted_rows_locked || exit 1
+fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+DRAIN_LOCK_HELD=false
 exit "$BRANCH_OUTCOMES_RC"

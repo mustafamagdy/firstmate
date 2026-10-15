@@ -60,14 +60,15 @@ SH
 file="$FM_HOME/state/.fake-drain"
 if [ "${1:-}" = --ack-through ]; then
   [ "${3:-}" = --recovery-generation ] && [ "${4:-}" = fixture-generation ] || exit 2
+  [ "${5:-}" = --receipt ] && [ "${6:-}" != none ] || exit 2
   printf '%s\n' "$2" >> "$FM_HOME/state/.fake-drain-acks"
   : > "$file"
   exit 0
 fi
 if [ -s "$file" ]; then
-  cat "$file"
+  awk -F '\t' 'NF>=5 && $2 ~ /^[0-9]+$/ { print $0 "\twake-receipt=" $2 ":abcd"; next } { print }' "$file"
   sequence=$(awk -F '\t' '$2 ~ /^[0-9]+$/ && $2 > max { max=$2 } END { print max + 0 }' "$file")
-  printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through %s --recovery-generation fixture-generation\n' "$sequence" >&2
+  printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --receipt RECEIPTS --ack-through %s --recovery-generation fixture-generation\n' "$sequence" >&2
 fi
 SH
   chmod +x "$dir/bin/"*.sh
@@ -84,7 +85,7 @@ ack_return() {  # <case-dir> <return-output>
   generation=$(printf '%s\n' "$output" | sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' | tail -1)
   [ -n "$sequence" ] && [ -n "$generation" ] || fail "return output lacked a generation-bound post-handling acknowledgement: $output"
   FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
-    "$dir/bin/fm-wake-drain.sh" --ack-through "$sequence" --recovery-generation "$generation"
+    "$dir/bin/fm-wake-drain.sh" --ack-through "$sequence" --recovery-generation "$generation" --receipt "$(printf '%s\n' "$output" | wake_receipt -)"
 }
 
 seed_live_blocker() {  # <case-dir> <backend> <key>
@@ -203,6 +204,8 @@ test_return_gate_owns_remediation_and_reports_catchup_to_bearings() {
   [ -s "$dir/home/state/.fake-drain" ] || fail "successful return consumed its wake before handling completed"
   [ ! -e "$dir/home/state/.fake-drain-acks" ] || fail "successful return acknowledged its wake inside evidence publication"
   assert_contains "$out" 'WAKE_ACK_REQUIRED: after handling completes' "successful return did not hand acknowledgement to the handling turn"
+  [ "$(printf '%s\n' "$out" | wake_receipt -)" != none ] || fail "return reformatted away the row receipts"
+  [ "$(printf '%s\n' "$out" | grep -c 'wake-receipt=')" = 1 ] || fail "return duplicated receipt fragments in prose evidence"
   ack_return "$dir" "$out" || fail "post-handling acknowledgement failed"
   [ ! -s "$dir/home/state/.fake-drain" ] || fail "explicit post-handling acknowledgement left the handled wake durable"
   [ "$(cat "$dir/home/state/.fake-drain-acks" 2>/dev/null || true)" = 2 ] \

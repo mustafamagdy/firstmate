@@ -1689,9 +1689,24 @@ handle_wake() {  # <reason> <state>
   [ "$classification_failed" -eq 0 ]
 }
 
+# Collect only complete presented rows, never the final acknowledgement hint.
+# Caller passes its captured stdout path (or - for stdin); empty rows use none.
+wake_presentation_receipt() { # <presentation-file>
+  awk -F '\t' '
+    NF >= 6 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      token=$NF
+      if (token ~ /^wake-receipt=[0-9]+:[a-f0-9]+$/) {
+        sub(/^wake-receipt=/, "", token)
+        printf "%s%s", (n++ ? "," : ""), token
+      }
+    }
+    END { if (!n) printf "none"; printf "\n" }
+  ' "$1"
+}
+
 handle_durable_wakes() {  # <watcher-reason> <state>
   local fallback_reason=$1 state=$2 out err tab epoch sequence kind key payload rest
-  local handled=0 failed=0 ack_through ack_generation
+  local handled=0 failed=0 ack_through ack_generation ack_receipt
   out=$(mktemp "$state/.subsuper-wake-drain.XXXXXX") || return 1
   err=$(mktemp "$state/.subsuper-wake-drain.XXXXXX") || { rm -f "$out"; return 1; }
   if ! "$FM_DAEMON_DIR/fm-wake-drain.sh" > "$out" 2> "$err"; then
@@ -1712,6 +1727,7 @@ handle_durable_wakes() {  # <watcher-reason> <state>
 
   ack_through=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err" | tail -1)
   ack_generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err" | tail -1)
+  ack_receipt=$(wake_presentation_receipt "$out") || failed=1
   grep -v '^WAKE_ACK_REQUIRED:' "$err" >&2 || true
   rm -f "$out" "$err"
   if [ "$failed" -ne 0 ]; then
@@ -1723,7 +1739,7 @@ handle_durable_wakes() {  # <watcher-reason> <state>
     return 1
   fi
   "$FM_DAEMON_DIR/fm-wake-drain.sh" --ack-through "$ack_through" \
-    --recovery-generation "$ack_generation"
+    --recovery-generation "$ack_generation" --receipt "$ack_receipt"
 }
 
 # --- log --------------------------------------------------------------------

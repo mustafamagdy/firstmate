@@ -6,6 +6,31 @@ This record supports current session-start, turn-end, watcher-continuity, superv
 Operator behavior and active limits remain in the linked current guides.
 Task-specific chronology, temporary paths, run identifiers, and delivery transcripts remain in private reports or PR evidence.
 
+## Wake acknowledgement presentation receipts
+
+Portable verification on 2026-10-15 used GNU Bash 5.3.9, Perl 5.40.1, and Node.js 26.9.0 on Linux.
+The receipt contract and command format belong to the header of `bin/fm-wake-drain.sh`.
+
+```sh
+bin/fm-test-run.sh tests/fm-wake-queue.test.sh
+bin/fm-test-run.sh tests/fm-supervision-instructions.test.sh
+bin/fm-test-run.sh tests/fm-pi-branch-extension.test.sh tests/fm-afk-return.test.sh tests/fm-inactive-reconcile.test.sh
+```
+
+Observed output included:
+
+```text
+ok - filtered, absent, and wrong row receipts refuse atomically; full rows and repeat succeed with full note detail
+ok - wake drain: main stale receipts are refused and a fresh presentation recovers
+ok - wake drain: branch stale receipts are refused and a fresh presentation recovers
+ok - requested and unsolicited healthy outcomes keep distinct delivery and event ownership
+ok - notice recovery remains idempotent across queue acknowledgement
+```
+
+The queue regression exercises downstream `head`, `tail`, and `grep` against complete executable output, checks that refusal leaves queue and recovery state unchanged, and checks complete inbox-note lines and repeated acknowledgements.
+The Pi regression uses SDK stubs with the real filesystem and shell commands; its installed-package checks explicitly skipped because the Pi package was unavailable.
+The supervision renderer covered every supported primary harness, while main and branch fixtures covered the shared acknowledgement path used by runtime backends and secondmate homes.
+
 ## Native session-start delivery
 
 The cross-harness transport pass ran on 2026-07-17 with Codex 0.144.4, Grok 0.2.103, OpenCode 1.17.18, Pi 0.80.10, and the tracked Claude hook wiring.
@@ -737,7 +762,7 @@ The lab opened the gates, interrupted a worker mid-turn, tried a main-actor stee
 | Boundary | main drained, acknowledged, and re-parked on every primary |
 | Return during an engine turn | the finished turn's outcome reached main: Codex and Grok through the host's hand-back line, Cursor through the queued `check: supervision-host outcome <n> ... was recorded after the captain returned` wake after the captain's message superseded the park, Claude through both, and OpenCode in the return brief |
 | Malformed engine result (Claude) | handed back as Stop-hook feedback that kept the `supervision-host:` line and named itself not a return |
-| A wake that lands between main's drain and its acknowledgement | main's acknowledgement claims only rows at or below its cutoff, so the away session can still take a later row; `tests/fm-wake-queue.test.sh` pins this, and no live run reached that window after the change |
+| A wake that lands between main's drain and its acknowledgement | main's acknowledgement consumes only receipt-proven rows at or below its cutoff, so the away session can still take a later row; `tests/fm-wake-queue.test.sh` pins this, and no live run reached that window after the change |
 
 Engine turns cost $0.06 to $0.79 each; whole away windows cost $0.66 (Claude), $1.21 (Cursor), $1.64 (OpenCode), $2.51 (Grok), and $3.76 (Codex, two windows).
 An engine-dispatched Grok 1.0.41 worker stops on Grok's workspace-trust prompt for a project under `/private/tmp`; the engine held it for the captain rather than answering it.

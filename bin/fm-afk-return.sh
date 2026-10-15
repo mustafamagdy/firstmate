@@ -775,7 +775,9 @@ EOF
     append_evidence lifecycle 'durable wake drain returned an invalid acknowledgement; retry catch-up before ordinary work' "$evidence"
     lifecycle_ok=0
   fi
-  append_evidence wake "$drained" "$evidence"
+  # Durable catch-up evidence is explanatory text. Publish the actual complete
+  # receipt-bearing rows once, after that evidence, preserving their tab fields.
+  append_evidence wake "$(printf '%s\n' "$drained" | sed 's/\twake-receipt=[^\t]*$//')" "$evidence"
 
   if fm_afk_contract_present "$STATE"; then
     if ! fm_afk_contract_validate "$(fm_afk_contract_path "$STATE")"; then
@@ -873,6 +875,14 @@ EOF
     return 3
   fi
 
+  if ! printf '%s\n' "$drained" | awk -F '\t' '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $NF ~ /^wake-receipt=[0-9]+:[a-f0-9]+$/ { print }
+  '; then
+    append_evidence lifecycle 'complete wake row publication failed; retry catch-up before ordinary work' "$evidence"
+    write_gate "$evidence" "$blockers" || { rm -f "$evidence" "$blockers" "$drain_err"; return 1; }
+    rm -f "$evidence" "$blockers" "$drain_err"
+    return 3
+  fi
   if [ -n "$wake_ack_line" ] && ! printf '%s\n' "$wake_ack_line" >&2; then
     append_evidence lifecycle 'durable wake acknowledgement command publication failed; retry catch-up before ordinary work' "$evidence"
     write_gate "$evidence" "$blockers" || { rm -f "$evidence" "$blockers" "$drain_err"; return 1; }

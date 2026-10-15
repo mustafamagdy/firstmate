@@ -312,16 +312,16 @@ Failing the whole drain would strand the usable rows too.
 | Main `--ack-through <SEQ>` | Only claimed main rows at or below the cutoff. |
 | Branch | Only claimed branch rows at or below its cutoff. |
 
-A main acknowledgement first claims every unreserved row at or below its cutoff, so none is stranded.
-It leaves a row above the cutoff that arrived after presentation unowned, so an away-session grant can still take it rather than handing every later wake back to main.
+Acknowledgement additionally requires the per-row presentation receipts owned by the header of `bin/fm-wake-drain.sh`; ownership alone does not prove presentation.
+It leaves rows that arrived after presentation unowned, so an away-session grant can still take it rather than handing every later wake back to main.
 
 Every settled branch prompt releases any residual grant.
 So an omitted or failed acknowledgement leaves the durable row available to a later main drain.
 A successful acknowledgement has already removed it.
 
 An acknowledgement can remove none of the actor's rows while a presented row above the cutoff still waits.
-Such an acknowledgement is reported as having acknowledged nothing, together with the exact `--ack-through` and `--recovery-generation` command for that presented row.
-The presented set is read before any re-claim, so a row that arrived after presentation is never named for unseen acknowledgement.
+An unproved acknowledgement is refused with the missing sequence numbers and a reminder to present the queue again.
+No acknowledgement claims unseen rows.
 
 If a branch offer loses the claim race to main, it rejects its settlement so the watcher retains the actionable close until Pi accepts its main follow-up.
 
@@ -335,7 +335,7 @@ Main is woken for it on that check's own triggering close.
 Under the away-posture record the exclusion lifts and a check row is offered to and claimed by the branch like every other actionable row.
 
 `fm-wake-drain.sh` never reclassifies a row itself.
-It filters the queue to the current actor's opaque claim before same-key deduplication, then presents and acknowledges only that actor-local view.
+It filters the queue to the current actor's opaque claim, then presents every sequence in that actor-local view, including repeated keys, for the receipt proof owned by `bin/fm-wake-drain.sh`.
 A missing or empty branch snapshot is refused loudly rather than read as "nothing eligible", because reaching the drain without the non-empty handoff promised by the extension is a wiring bug.
 A branch acknowledgement retires the check-row receipts - inactive-outcome, inactive-reconcile notice, and secondmate stall - of exactly the granted sequences it consumes, so a branch-consumed check is never re-queued by its producer.
 Attended, a grant names no check row and each scan finds nothing.

@@ -85,7 +85,9 @@ if [ "$mode" = hang ]; then
 fi
 drain=$("$FM_REPO/bin/fm-wake-drain.sh" 2>&1)
 printf '%s\n' "$drain" > "$FM_HOME/engine-drain.$n"
-ack=$(printf '%s\n' "$drain" | sed -n 's/^WAKE_ACK_REQUIRED: after handling completes run bin\/fm-wake-drain.sh //p' | tail -1)
+ack=$(printf '%s\n' "$drain" | sed -n 's/^WAKE_ACK_REQUIRED:.*run bin\/fm-wake-drain.sh //p' | tail -1)
+receipt=$(printf '%s\n' "$drain" | awk -F '\t' '$NF ~ /^wake-receipt=/ { token=$NF; sub(/^wake-receipt=/,"",token); printf "%s%s", (n++ ? "," : ""), token } END { if(!n) printf "none" }')
+ack=${ack/RECEIPTS/$receipt}
 task=$(sed -n 's/^tasks=//p' "$STATE/.supervision-host-turn" | awk '{ print $1 }')
 [ -n "$task" ] || task=fleet
 verdict=routine
@@ -706,7 +708,7 @@ test_branch_outcomes_stay_unread_when_the_drain_cannot_print() {
   : > "$home/config/supervision-host"
   FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append --task demo --verdict routine --summary 'merged the docs fix' >/dev/null \
     || fail "fixture: could not record the routine outcome"
-  FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" >&- 2>/dev/null' "$ROOT/bin/fm-wake-drain.sh" || true
+  FM_HOME="$home" "$FAKE_CLAUDE" -c 'bash "$0" >&- 2>/dev/null' "$ROOT/bin/fm-wake-drain.sh" || true
   drained=$(FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
   assert_contains "$drained" "[seq 1] demo: merged the docs fix" "a routine outcome a drain could not print must follow on the next drain"
   drained=$(FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
@@ -1191,7 +1193,8 @@ hook_exited() { [ -s "$1/hook.rc" ]; }
 main_drain() {  # <home>; prints the drain and sets MAIN_ACK
   local out
   out=$(FM_HOME="$1" "$FAKE_CLAUDE" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
-  MAIN_ACK=$(printf '%s\n' "$out" | sed -n 's/^WAKE_ACK_REQUIRED: after handling completes run bin\/fm-wake-drain.sh //p' | tail -1)
+  MAIN_ACK=$(printf '%s\n' "$out" | sed -n 's/^WAKE_ACK_REQUIRED:.*run bin\/fm-wake-drain.sh //p' | tail -1)
+  MAIN_ACK=${MAIN_ACK/RECEIPTS/$(printf '%s\n' "$out" | wake_receipt -)}
   printf '%s\n' "$out"
 }
 
@@ -2604,7 +2607,7 @@ test_first_cycle_status_streams_and_owner_options_reach_it() {
   [ "$(sed -n '1p' "$home/host.out" | cut -c1-17)" = 'watcher: started ' ] || fail "stream: the status line must come first"
   assert_re '^signal: .*demo.status' "$home/host.out" "stream: the close must follow the status line"
   # Main handles that close, so the next cycle has no episode to resurface.
-  FM_HOME="$home" "$ROOT/bin/fm-wake-drain.sh" >/dev/null 2> "$home/drain.err" || fail "stream: main's drain failed"
+  FM_HOME="$home" "$ROOT/bin/fm-wake-drain.sh" > "$home/drain.out" 2> "$home/drain.err" || fail "stream: main's drain failed"
   ack_drain_err "$home/state" "$home/drain.err" >/dev/null 2>&1 || fail "stream: main's acknowledgement failed: $(cat "$home/drain.err")"
   # Pass-through can leave a successor watcher running. Retire that cycle so
   # the orphan-arm fixture below owns the watcher we later ask --restart to replace.
@@ -2655,7 +2658,8 @@ test_first_cycle_status_streams_and_owner_options_reach_it() {
 main_drain_and_ack() {  # <home>
   local out ack
   out=$(FM_HOME="$1" "$ROOT/bin/fm-wake-drain.sh" 2>&1)
-  ack=$(printf '%s\n' "$out" | sed -n 's/^WAKE_ACK_REQUIRED: after handling completes run bin\/fm-wake-drain.sh //p' | tail -1)
+  ack=$(printf '%s\n' "$out" | sed -n 's/^WAKE_ACK_REQUIRED:.*run bin\/fm-wake-drain.sh //p' | tail -1)
+  ack=${ack/RECEIPTS/$(printf '%s\n' "$out" | wake_receipt -)}
   # shellcheck disable=SC2086 # the printed acknowledgement arguments
   [ -z "$ack" ] || FM_HOME="$1" "$ROOT/bin/fm-wake-drain.sh" $ack >/dev/null 2>&1 || fail "main's acknowledgement failed: $ack"
 }

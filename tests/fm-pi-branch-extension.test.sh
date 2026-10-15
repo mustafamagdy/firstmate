@@ -1032,7 +1032,7 @@ globalThis.__fmOnBranchPrompt = async ({ session }) => {
     {},
   );
   if (result.isError) throw new Error(`branch report failed: ${JSON.stringify(result)}`);
-  await runFleetCommand(session, ["--ack-through", ack[1], "--recovery-generation", ack[2]]);
+  await runFleetCommand(session, ["--ack-through", ack[1], "--recovery-generation", ack[2], "--receipt", drained.stdout.split("\n").filter((line) => /^\d+\t/.test(line)).map((line) => line.split("\t").at(-1).replace(/^wake-receipt=/, "")).join(",") || "none"]);
 };
 
 const explicitRequest = "Please give me a fresh mini system-resource report.";
@@ -1072,6 +1072,7 @@ entries.push({ type: "message", message: { role: "user", content: legacyOperatio
 await fire("agent_start", {}, mainCtx);
 const unsolicited = dispatch("signal: healthy resource result");
 if (!unsolicited.accepted) throw new Error("branch did not accept the unsolicited result");
+await unsolicited.settlement;
 await settle(() => fleetOperations.length === 2, "unsolicited result acknowledgement");
 if (sentToMain.length !== 1 || sentToMain[0].options.triggerTurn) {
   throw new Error(`unsolicited healthy result opened a main turn: ${JSON.stringify(sentToMain)}`);
@@ -1101,6 +1102,7 @@ for (let index = 0; index < requestedPrompts.length; index += 1) {
   await fire("agent_start", {}, mainCtx);
   const requested = dispatch("signal: healthy resource result");
   if (!requested.accepted) throw new Error(`branch did not accept requested result ${index}`);
+  await requested.settlement;
   await settle(() => fleetOperations.length === 4 + (index * 2), `requested result ${index} acknowledgement`);
   const deliveredRequestMirror = globalThis.__fmSessions[0].ops
     .filter((op) => op.kind === "custom" && op.message.customType === "fm-main-mirror")
@@ -2285,7 +2287,7 @@ globalThis.__fmOnBranchPrompt = async ({ session }) => {
     {},
   );
   if (result.isError) throw new Error(`branch report failed: ${JSON.stringify(result)}`);
-  await runFleetCommand(session, ["--ack-through", ack[1], "--recovery-generation", ack[2]]);
+  await runFleetCommand(session, ["--ack-through", ack[1], "--recovery-generation", ack[2], "--receipt", drained.stdout.split("\n").filter((line) => /^\d+\t/.test(line)).map((line) => line.split("\t").at(-1).replace(/^wake-receipt=/, "")).join(",") || "none"]);
 };
 async function wakeBranch(message) {
   const offer = makeOffer(message, [approvedProject]);

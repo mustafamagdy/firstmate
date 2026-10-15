@@ -998,3 +998,14 @@ fm_test_base_path_sans() {
   done
   printf '%s\n' "$dir"
 }
+
+# Parse the public presentation format; do not obtain receipts from state files.
+wake_receipt() { # <captured-stdout-file>, or - for stdin
+  awk -F '\t' '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $NF ~ /^wake-receipt=[0-9]+:[a-f0-9]+$/ {
+      token=$NF; sub(/^wake-receipt=/, "", token)
+      printf "%s%s", (n++ ? "," : ""), token
+    }
+    END { if (!n) printf "none"; printf "\n" }
+  ' "$1"
+}

@@ -403,13 +403,13 @@ EOF
       "$kind marker fixture unexpectedly depended on the network report"
 
     err="$home/drain.err"
-    FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$DRAIN" >/dev/null 2> "$err"
+    FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$DRAIN" > "${err%.err}.out" 2> "$err"
     seq=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation .*/\1/p' "$err")
     generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
     [ -n "$seq" ] && [ -n "$generation" ] \
       || fail "$kind marker wake did not issue a durable acknowledgement"
     FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$DRAIN" \
-      --ack-through "$seq" --recovery-generation "$generation" >/dev/null
+      --ack-through "$seq" --recovery-generation "$generation" --receipt "$(wake_receipt "${err%.err}.out")" >/dev/null
     assert_no_grep 'inactive-reconcile-diagnostic:invalid-secondmate-home' "$home/state/.wake-queue" \
       "$kind marker wake could not be acknowledged"
   done

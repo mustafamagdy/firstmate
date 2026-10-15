@@ -2846,3 +2846,31 @@ EOF
 
   return 0
 }
+
+# Inbox paths come only from validated queue keys in this home. Show complete
+# first lines, without the watcher's summary truncation, including long lines.
+fm_wake_print_inbox_details() { # <raw-rows>
+  local rows=$1 epoch seq kind key payload id path
+  while IFS=$(printf '\t') read -r epoch seq kind key payload; do
+    [ "$kind" = check ] || continue
+    case "$key" in inbox:*) id=${key#inbox:} ;; *) continue ;; esac
+    case "$id" in ''|.*|*[!A-Za-z0-9._-]*) continue ;; esac
+    path="$STATE/inbox/$id.note"
+    if [ ! -f "$path" ] || [ -L "$path" ] || [ ! -r "$path" ]; then
+      printf 'CAPTAIN INBOX NOTE %s (seq %s): note unavailable at %s; inspect before handling\n' "$id" "$seq" "$path" || return 1
+      continue
+    fi
+    printf 'CAPTAIN INBOX NOTE %s (seq %s), first full body lines:\n' "$id" "$seq" || return 1
+    perl -MFcntl=:DEFAULT -e '
+      sysopen(my $note, $ARGV[0], O_RDONLY | O_NOFOLLOW) or exit 1;
+      my @stat=stat $note; exit 1 unless @stat && -f _;
+      my ($body, $lines)=(0, 0);
+      while (<$note>) {
+        if ($body) { print "    $_" or exit 1; last if ++$lines==5 }
+        elsif (/^--\r?\n?$/) { $body=1 }
+      }
+    ' "$path" || return 1
+  done <<EOF
+$rows
+EOF
+}
