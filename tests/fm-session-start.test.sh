@@ -2420,7 +2420,7 @@ EOF
   [ -n "$sequence" ] && [ -n "$generation" ] \
     || fail "--reemit omitted the generation-bound wake acknowledgement"
   FM_STATE_OVERRIDE="$home/state" "$ROOT/bin/fm-wake-drain.sh" --ack-through "$sequence" \
-    --recovery-generation "$generation" || fail "--reemit wake acknowledgement failed"
+    --recovery-generation "$generation" --receipt "$(printf '%s\n' "$reemit" | wake_receipt -)" || fail "--reemit wake acknowledgement failed"
   [ ! -s "$home/state/.wake-queue" ] || fail "--reemit acknowledgement left queued wakes behind"
   assert_contains "$reemit" "CONTEXT" "--reemit dropped the context digest"
   assert_contains "$reemit" "FLEET STATE" "--reemit dropped the fleet-state digest"

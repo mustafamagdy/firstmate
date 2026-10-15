@@ -136,7 +136,7 @@ wait_for_file_text() {  # <file> <fixed-text>
 ack_wakes() {  # <state>
   local state=$1 sequence generation err
   err="$state/.test-ack.err"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "${err%.err}.out" 2> "$err" || return 1
   sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
   generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
   rm -f "$err"
@@ -146,7 +146,7 @@ ack_wakes() {  # <state>
     return 0
   fi
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
-    --recovery-generation "$generation"
+    --recovery-generation "$generation" --receipt "$(wake_receipt "${err%.err}.out")"
 }
 
 # Print "<sequence>\t<generation>" from the acknowledgement command a drain
@@ -502,7 +502,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
   generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$dir/replayed-decision-drain.err")
   [ "$sequence" = 0 ] && [ -n "$generation" ] \
     || fail "replayed decision recovery omitted its current acknowledgement generation"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" --recovery-generation "$generation" \
+  FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" --recovery-generation "$generation" --receipt "$(wake_receipt "$dir/replayed-decision-drain.out")" \
     || fail "completed decision handling could not acknowledge current recovery"
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/decision-successor-arm.out"
   is_live_non_zombie "$ARM_PID" || fail "acknowledged decision recovery did not leave a live successor"
@@ -726,7 +726,7 @@ test_interrupted_handling_is_redrained_on_rearm() {
   [ -n "$sequence" ] && [ -n "$generation" ] \
     || fail "re-drain did not emit a generation-bound post-handling acknowledgement command"
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
-    --recovery-generation "$generation" \
+    --recovery-generation "$generation" --receipt "$(wake_receipt "$dir/replay-drain.out")" \
     || fail "completed replay could not acknowledge the handled wake"
   [ ! -s "$state/.wake-queue" ] || fail "acknowledged replay remained in the durable queue"
   pass "watch-arm: interrupted handling leaves its wake durable for successor re-drain"
@@ -979,7 +979,7 @@ test_handling_window_close_keeps_the_acknowledgement_valid() {
   [ "$(cat "$state/.watcher-down" 2>/dev/null || true)" = "pending:downtime:$generation" ] \
     || fail "repeated publications during handling replaced the outstanding recovery generation"
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
-    --recovery-generation "$generation" 2> "$dir/ack.err" \
+    --recovery-generation "$generation" --receipt "$(wake_receipt "$dir/drain.out")" 2> "$dir/ack.err" \
     || fail "the printed acknowledgement was rejected after repeated publications: $(cat "$dir/ack.err")"
   ! grep "$(printf '\tsignal\thandled.status\t')" "$state/.wake-queue" >/dev/null \
     || fail "the acknowledged wake was not consumed"
@@ -991,7 +991,7 @@ test_handling_window_close_keeps_the_acknowledgement_valid() {
   pair=$(drain_ack_pair "$dir/remaining-drain.err") \
     || fail "remaining drain did not print an acknowledgement command"
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "${pair%%$'\t'*}" \
-    --recovery-generation "${pair##*$'\t'}" \
+    --recovery-generation "${pair##*$'\t'}" --receipt "$(wake_receipt "$dir/remaining-drain.out")" \
     || fail "remaining handling-window wake could not be acknowledged"
   [ ! -s "$state/.wake-queue" ] || fail "remaining wake was not consumed"
   case "$(cat "$state/.watcher-down" 2>/dev/null || true)" in
@@ -1033,7 +1033,7 @@ test_moved_generation_acknowledgement_is_self_healing() {
   first_sequence=${pair%%$'\t'*}
   first_generation=${pair##*$'\t'}
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$first_sequence" \
-    --recovery-generation "$first_generation" \
+    --recovery-generation "$first_generation" --receipt "$(wake_receipt "$dir/first-drain.out")" \
     || fail "the first handled wake could not be acknowledged"
 
   # A retired episode does not freeze the generation: the next one is its own.
@@ -1049,7 +1049,7 @@ test_moved_generation_acknowledgement_is_self_healing() {
   # Replaying the stale pair must not fail, must not over-consume, and must not
   # retire the newer episode.
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$first_sequence" \
-    --recovery-generation "$first_generation" 2> "$dir/stale-ack.err" \
+    --recovery-generation "$first_generation" --receipt "$(wake_receipt "$dir/first-drain.out")" 2> "$dir/stale-ack.err" \
     || fail "a replayed stale acknowledgement was rejected instead of degrading safely"
   if ! grep -F 'WAKE_ACK_REQUIRED' "$dir/stale-ack.err" >/dev/null \
     || ! grep -F 're-run' "$dir/stale-ack.err" >/dev/null; then
@@ -1060,15 +1060,12 @@ test_moved_generation_acknowledgement_is_self_healing() {
   [ "$(cat "$state/.watcher-down" 2>/dev/null || true)" = "pending:downtime:$second_generation" ] \
     || fail "a stale acknowledgement retired the newer recovery episode"
 
-  # The sequence alone owns consumption, so the handled rows go even while the
-  # generation is stale, and only the episode stays pending.
-  FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through 999 \
-    --recovery-generation "$first_generation" 2> "$dir/stale-consume.err" \
-    || fail "a stale acknowledgement refused to consume the rows it was given"
-  [ ! -s "$state/.wake-queue" ] \
-    || fail "a stale acknowledgement left its handled rows on the durable queue"
-  [ "$(cat "$state/.watcher-down" 2>/dev/null || true)" = "pending:downtime:$second_generation" ] \
-    || fail "row consumption under a stale generation retired the pending episode"
+  # A higher cutoff cannot manufacture proof for an unseen row.
+  if FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through 999 \
+    --recovery-generation "$first_generation" --receipt "$(wake_receipt "$dir/first-drain.out")" 2> "$dir/stale-consume.err"; then
+    fail "an unseen row was consumed with an old receipt"
+  fi
+  [ -s "$state/.wake-queue" ] || fail "unseen row disappeared"
 
   # Following the printed remedy closes the episode, so the loop is self-healing.
   FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$DRAIN" > "$dir/redrain.out" \
@@ -1076,7 +1073,7 @@ test_moved_generation_acknowledgement_is_self_healing() {
   pair=$(drain_ack_pair "$dir/redrain.err") \
     || fail "the remedy re-drain did not print the newer acknowledgement command"
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "${pair%%$'\t'*}" \
-    --recovery-generation "${pair##*$'\t'}" \
+    --recovery-generation "${pair##*$'\t'}" --receipt "$(wake_receipt "$dir/redrain.out")" \
     || fail "the newer recovery episode could not be acknowledged"
   case "$(cat "$state/.watcher-down" 2>/dev/null || true)" in
     acked:*) ;;

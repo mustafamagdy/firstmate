@@ -54,7 +54,7 @@ ack_handled_wakes() {  # <state> <drain-stderr>
   generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$drain_err")
   [ -n "$sequence" ] && [ -n "$generation" ] || return 1
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
-    --recovery-generation "$generation"
+    --recovery-generation "$generation" --receipt "$(wake_receipt "${drain_err%.err}.out")"
 }
 
 # --- Phase 1: routine self-handled, queued; terminal caught after restart ---
