@@ -43,6 +43,11 @@
 # FILES. state/.captain-wait (owner-only) holds the open episode;
 # state/.captain-wait.log is the home-local log of failures, never the topic.
 #
+# LOCKING. Every episode write and delete holds state/.captain-wait.lock. Each
+# episode carries a random id; tick claims an attempt under the lock, counts
+# holds and POSTs with the lock released, then records the result only if the
+# same episode is still there, so a clear or a new episode is never undone.
+#
 # Usage:
 #   fm-captain-wait.sh open <task-id>     record a new captain hold
 #   fm-captain-wait.sh hook claude        Claude Stop or UserPromptSubmit payload on stdin
@@ -119,14 +124,23 @@ primary_claude_session() {
 
 unlock() { fm_lock_release "$LOCK" >/dev/null 2>&1 || true; }
 
-# Episode fields: holds, opened, start, attempts, next, sent.
-E_HOLDS='' E_OPENED='' E_START='' E_ATTEMPTS=0 E_NEXT=0 E_SENT=0
+# A random episode id: unique even for episodes opened in the same second.
+new_episode_id() {
+  local id
+  id=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  case "$id" in ''|*[!0-9a-f]*) id="$(date +%s).$$.$RANDOM$RANDOM" ;; esac
+  printf '%s\n' "$id"
+}
+
+# Episode fields: id, holds, opened, start, attempts, next, sent.
+E_ID='' E_HOLDS='' E_OPENED='' E_START='' E_ATTEMPTS=0 E_NEXT=0 E_SENT=0
 read_episode() {
   local key value
-  E_HOLDS='' E_OPENED='' E_START='' E_ATTEMPTS=0 E_NEXT=0 E_SENT=0
+  E_ID='' E_HOLDS='' E_OPENED='' E_START='' E_ATTEMPTS=0 E_NEXT=0 E_SENT=0
   [ -f "$EPISODE" ] || return 1
   while IFS='=' read -r key value || [ -n "$key" ]; do
     case "$key" in
+      id) E_ID=$value ;;
       holds) E_HOLDS=$value ;;
       opened) E_OPENED=$value ;;
       start) E_START=$value ;;
@@ -146,8 +160,8 @@ read_episode() {
 write_episode() {
   local tmp
   tmp=$(umask 077 && mktemp "$EPISODE.tmp.XXXXXX" 2>/dev/null) || return 1
-  if printf 'holds=%s\nopened=%s\nstart=%s\nattempts=%s\nnext=%s\nsent=%s\n' \
-    "$E_HOLDS" "$E_OPENED" "$E_START" "$E_ATTEMPTS" "$E_NEXT" "$E_SENT" > "$tmp" \
+  if printf 'id=%s\nholds=%s\nopened=%s\nstart=%s\nattempts=%s\nnext=%s\nsent=%s\n' \
+    "$E_ID" "$E_HOLDS" "$E_OPENED" "$E_START" "$E_ATTEMPTS" "$E_NEXT" "$E_SENT" > "$tmp" \
     && mv -f "$tmp" "$EPISODE"; then
     return 0
   fi
@@ -167,7 +181,7 @@ cmd_open() {  # <task-id>
   if read_episode; then
     case " $E_HOLDS " in *" $id "*) ;; *) E_HOLDS=${E_HOLDS:+$E_HOLDS }$id ;; esac
   else
-    E_HOLDS=$id E_OPENED=$now
+    E_ID=$(new_episode_id) E_HOLDS=$id E_OPENED=$now
   fi
   write_episode || log "could not record a waiting question"
   unlock
@@ -175,7 +189,7 @@ cmd_open() {  # <task-id>
 
 cmd_clear() {
   [ -f "$EPISODE" ] || return 0
-  lock || { drop_episode; return 0; }
+  lock || { log "could not end the waiting question: its lock stayed busy"; return 0; }
   drop_episode
   unlock
 }
@@ -307,7 +321,7 @@ open_question_count() {
 }
 
 cmd_tick() {
-  local now count body
+  local now count body id sent
   [ -f "$EPISODE" ] || return 0
   if ! enabled; then
     drop_episode
@@ -333,31 +347,52 @@ cmd_tick() {
   [ "$now" -ge $((E_START + S_DELAY)) ] || return 0
   [ "$E_ATTEMPTS" -eq 0 ] || [ "$now" -ge "$E_NEXT" ] || return 0
   lock || return 0
-  # Re-read under the lock: the captain may have answered meanwhile.
-  if ! read_episode || [ "$E_SENT" = 1 ]; then
+  # Re-read under the lock: the captain may have answered meanwhile, or another
+  # tick may have claimed this attempt.
+  if ! read_episode || [ "$E_SENT" = 1 ] \
+    || { [ "$E_ATTEMPTS" -gt 0 ] && [ "$now" -lt "$E_NEXT" ]; }; then
     unlock
     return 0
   fi
-  count=$(open_question_count)
-  if [ "$count" -eq 0 ]; then
-    drop_episode
-    unlock
-    return 0
-  fi
-  if [ "$count" -eq 1 ]; then
-    body='1 question is waiting for your answer.'
-  else
-    body="$count questions are waiting for your answer."
-  fi
+  # Claim the attempt, then do the slow work without the lock.
+  [ -n "$E_ID" ] || E_ID=$(new_episode_id)
   E_ATTEMPTS=$((E_ATTEMPTS + 1))
   E_NEXT=$((now + RETRY_SECS))
-  if post "$body"; then
-    E_SENT=1
-  elif [ "$E_ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
-    E_SENT=1
-    log "reminder given up after $E_ATTEMPTS failed attempts"
+  if ! write_episode; then
+    unlock
+    log "could not claim a reminder attempt"
+    return 0
   fi
-  write_episode || drop_episode
+  unlock
+  id=$E_ID
+  count=$(open_question_count)
+  if [ "$count" -eq 0 ]; then
+    sent=none
+  else
+    if [ "$count" -eq 1 ]; then
+      body='1 question is waiting for your answer.'
+    else
+      body="$count questions are waiting for your answer."
+    fi
+    if post "$body"; then
+      sent=1
+    elif [ "$E_ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+      sent=1
+      log "reminder given up after $E_ATTEMPTS failed attempts"
+    else
+      sent=0
+    fi
+  fi
+  # Commit only to the same episode; a cleared or replaced one stays as it is.
+  lock || { log "could not record the reminder result: its lock stayed busy"; return 0; }
+  if read_episode && [ "$E_ID" = "$id" ]; then
+    if [ "$sent" = none ]; then
+      drop_episode
+    elif [ "$sent" = 1 ]; then
+      E_SENT=1
+      write_episode || drop_episode
+    fi
+  fi
   unlock
 }
 
