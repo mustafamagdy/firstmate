@@ -46,18 +46,20 @@ git init -q "$PRIMARY_ROOT"
 ln -s "$ROOT/bin" "$PRIMARY_ROOT/bin"
 WAIT="$PRIMARY_ROOT/bin/fm-captain-wait.sh"
 
-# A local fake ntfy endpoint answering <code>; it appends one JSON line per
-# request (path, Title header, body) to <log> and prints its port.
-start_endpoint() {  # <code> <log>
-  local code=$1 log=$2 portfile="$TMP_ROOT/port.$RANDOM$RANDOM" pid i
+# A local fake ntfy endpoint answering <code>, after [delay] seconds; it appends
+# one JSON line per request (path, Title header, body) to <log> on arrival and
+# prints its port.
+start_endpoint() {  # <code> <log> [delay]
+  local code=$1 log=$2 delay=${3:-0} portfile="$TMP_ROOT/port.$RANDOM$RANDOM" pid i
   python3 -I -c '
-import http.server, json, sys
-code, log, portfile = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+import http.server, json, sys, time
+code, log, portfile, delay = int(sys.argv[1]), sys.argv[2], sys.argv[3], float(sys.argv[4])
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         with open(log, "a") as f:
             f.write(json.dumps({"path": self.path, "title": self.headers.get("Title"), "body": body}) + "\n")
+        time.sleep(delay)
         self.send_response(code)
         self.end_headers()
     def log_message(self, *a):
@@ -66,7 +68,7 @@ s = http.server.HTTPServer(("127.0.0.1", 0), H)
 with open(portfile, "w") as f:
     f.write(str(s.server_port))
 s.serve_forever()
-' "$code" "$log" "$portfile" >/dev/null 2>&1 &
+' "$code" "$log" "$portfile" "$delay" >/dev/null 2>&1 &
   pid=$!
   SERVER_PIDS+=("$pid")
   for i in $(seq 1 50); do
@@ -83,6 +85,10 @@ OK_PORT=$(start_endpoint 200 "$OK_LOG")
 BAD_LOG="$TMP_ROOT/bad-requests.jsonl"
 : > "$BAD_LOG"
 BAD_PORT=$(start_endpoint 500 "$BAD_LOG")
+# Slower than the episode lock's wait limit, so a POST in flight overlaps a clear.
+SLOW_LOG="$TMP_ROOT/slow-requests.jsonl"
+: > "$SLOW_LOG"
+SLOW_PORT=$(start_endpoint 200 "$SLOW_LOG" 6)
 # A port nothing listens on: bind, read, release.
 DEAD_PORT=$(python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 
@@ -297,6 +303,50 @@ test_post_failure_is_harmless_and_bounded() {
   pass "captain-wait: a failing or unreachable endpoint is logged without the topic, retried twice, then given up"
 }
 
+# A clear, and a new hold, that land while a slow reminder POST is in flight.
+test_clear_during_slow_post_stays_cleared() {
+  local home start pid i
+  home=$(make_home slow "$(config_for "$SLOW_PORT" 0)")
+  hold "$home" q-slow
+  hook "$home" Stop
+  start=$(field "$home" start)
+  set_field "$home" start $((start - 1))
+  tick "$home" &
+  pid=$!
+  for i in $(seq 1 50); do
+    [ "$(requests "$SLOW_LOG")" -ge 1 ] && break
+    sleep 0.1
+  done
+  assert_equals 1 "$(requests "$SLOW_LOG")" "the reminder POST must be in flight"
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_CONFIG_OVERRIDE="$home/config" "$WAIT" clear
+  assert_absent "$home/state/.captain-wait" "a clear during a POST must end the episode"
+  wait "$pid" || fail "the slow tick failed"
+  assert_absent "$home/state/.captain-wait" "a tick finishing its POST must not recreate a cleared episode"
+  tick "$home"
+  assert_equals 1 "$(requests "$SLOW_LOG")" "a cleared episode must record no further send"
+
+  # A new episode opened during the POST is a different episode: the finishing
+  # tick must not mark it sent or spend its attempts.
+  hold "$home" q-slow-a
+  hook "$home" Stop
+  start=$(field "$home" start)
+  set_field "$home" start $((start - 1))
+  tick "$home" &
+  pid=$!
+  for i in $(seq 1 50); do
+    [ "$(requests "$SLOW_LOG")" -ge 2 ] && break
+    sleep 0.1
+  done
+  assert_equals 2 "$(requests "$SLOW_LOG")" "the second reminder POST must be in flight"
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_CONFIG_OVERRIDE="$home/config" "$WAIT" clear
+  hold "$home" q-slow-b
+  wait "$pid" || fail "the second slow tick failed"
+  assert_equals q-slow-b "$(field "$home" holds)" "the new episode must survive the finishing tick"
+  assert_equals 0 "$(field "$home" sent)" "the finishing tick must not mark a new episode sent"
+  assert_equals 0 "$(field "$home" attempts)" "the finishing tick must not spend a new episode's attempts"
+  pass "captain-wait: a clear during a slow reminder POST stays cleared, and a new episode keeps its own reminder"
+}
+
 test_env_file_settings() {
   local home before start
   home=$(make_home envfile "env-file=ntfy.env
@@ -336,6 +386,7 @@ test_inbox_note_clears
 test_repeat_or_deferred_hold_opens_nothing
 test_answered_question_sends_nothing
 test_post_failure_is_harmless_and_bounded
+test_clear_during_slow_post_stays_cleared
 test_env_file_settings
 test_secondmate_home_is_off
 test_watcher_runs_the_tick
