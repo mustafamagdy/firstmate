@@ -1291,6 +1291,8 @@ SPAWN_TASK_SET_LOCK_HELD=0
 SPAWN_TREEHOUSE_PROJECT_LOCK=
 SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
 SPAWN_SLOT_CLAIMED=0
+SPAWN_SLOT_LEASED=0
+SPAWN_WT_ACQUIRE=
 RELAUNCH_REPLACEMENT_PENDING=0
 RELAUNCH_REPLACEMENT_BUSY_GEN=
 RELAUNCH_REPLACEMENT_HARNESS=
@@ -1443,6 +1445,14 @@ spawn_abort_cleanup() {
     else
       echo "warning: leaving task $ID's slot claim on $WT in place; the Treehouse project lock is no longer held, so the next spawn's claim replaces it" >&2
     fi
+  fi
+  # A durable lease outlives the abort, and releasing it here would mean
+  # `treehouse return --force`, which kills whatever still runs in the endpoint
+  # left for inspection. Name it instead so the by-hand closeout releases it.
+  if [ "$SPAWN_SLOT_LEASED" = 1 ] && [ -n "${WT:-}" ] &&
+    [ ! -e "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ]; then
+    SPAWN_SLOT_LEASED=0
+    echo "warning: Treehouse slot $WT stays durably leased to task $ID after this aborted spawn; once its endpoint is closed, release it with: (cd $(shell_quote "$PROJ_ABS") && treehouse return $(shell_quote "$WT"))" >&2
   fi
   if [ "$SPAWN_TREEHOUSE_PROJECT_LOCK_HELD" = 1 ]; then
     SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
@@ -4080,10 +4090,9 @@ spawn_send_key() { # <target> <key>
 }
 
 # Enter the exact copy recorded for this task immediately before trust setup and
-# launch. Herdr restores a pane's shell cwd from its durable tab layout, so a
-# treehouse subshell's foreground cwd is not enough to keep a later pane restart
-# out of the primary checkout. The same explicit cd gives every backend one
-# launch boundary and makes a dropped or ignored cwd change a refusal.
+# launch. The explicit cd gives every backend one launch boundary and makes a
+# dropped or ignored cwd change a refusal. It reaches only the pane's foreground
+# shell; spawn_assert_restore_worktree owns the Herdr restore folder.
 spawn_enter_recorded_worktree() {
   [ "$KIND" = secondmate ] && return 0
   spawn_send_text_line "$WT_TARGET" "cd -- $(shell_quote "$WT")" || {
@@ -4108,6 +4117,35 @@ spawn_assert_agent_worktree() {
     [ "$i" -ge 20 ] || sleep 0.5
   done
   echo "error: task $ID's worker started in '${seen:-unknown}', not its recorded worktree '$WT'; refusing to continue outside the copy holding its work" >&2
+  exit 1
+}
+
+# Herdr restores a pane into its top shell's folder (fm_backend_herdr_folders),
+# so the agent's foreground folder alone does not prove where a restarted worker
+# resumes. A fresh Herdr spawn moved its top shell into the leased slot, so a
+# top shell elsewhere means something nested is holding the pane and the spawn
+# refuses before any agent starts. A relaunch reuses whatever pane it adopted:
+# one spawned before the lease change can still hold the old nested shell, so
+# it warns and leaves the liveness checks (fm_backend_endpoint_folder_state) to
+# catch the pane if a restart ever puts its worker in the wrong folder.
+spawn_assert_restore_worktree() {
+  local expected folders restore i
+  [ "$KIND" = secondmate ] && return 0
+  [ "$BACKEND" = herdr ] || return 0
+  expected=$(real_path_or_raw "$WT")
+  for i in $(seq 1 20); do
+    folders=$(fm_backend_herdr_folders "$WT_TARGET" || true)
+    restore=${folders%%$'\t'*}
+    if [ -n "$restore" ] && [ "$(real_path_or_raw "$restore")" = "$expected" ]; then
+      return 0
+    fi
+    [ "$i" -ge 20 ] || sleep 0.5
+  done
+  if [ "$RELAUNCH" -eq 1 ]; then
+    echo "warning: task $ID's Herdr pane would restore into '${restore:-unknown}', not its recorded worktree '$WT', after a restart; the worker starts in its worktree now, and liveness checks report the pane if a restart moves it" >&2
+    return 0
+  fi
+  echo "error: task $ID's Herdr pane would restore into '${restore:-unknown}', not its recorded worktree '$WT', after a restart; refusing to start a worker that a restart would resume outside the copy holding its work; inspect window $T" >&2
   exit 1
 }
 
@@ -4441,9 +4479,25 @@ elif [ "$RELAUNCH" -eq 1 ]; then
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  # Herdr saves and restores each pane's TOP shell folder after a server or host
+  # restart, never a nested shell's (docs/herdr-backend.md "Restart and liveness
+  # behavior"). An interactive `treehouse get` would leave the top shell in the
+  # project, often the primary checkout, and a restored worker would resume
+  # there. So on Herdr the top shell itself takes a durable lease, the same
+  # `get --lease --lease-holder` bin/fm-home-seed.sh uses for secondmate homes,
+  # and moves into the leased slot: no nested shell, and the slot stays reserved
+  # across a restart instead of looking free once the pane's processes are gone.
+  # bin/fm-teardown.sh's `treehouse return --force` releases the lease.
+  if [ "$BACKEND" = herdr ]; then
+    SPAWN_WT_ACQUIRE="treehouse get --lease"
+    spawn_send_text_line "$WT_TARGET" "cd -- \"\$(treehouse get --lease --lease-holder $(shell_quote "$ID"))\""
+  else
+    SPAWN_WT_ACQUIRE="treehouse get"
+    spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  fi
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
+  # Wait for the treehouse subshell, or on Herdr the top shell's cd into the
+  # leased slot: the pane's cwd moves from the project to the worktree.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
@@ -4496,18 +4550,19 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter an isolated worktree within 60s (last seen '${last_seen:-none}': $last_reason; spawning project '$PROJ_ABS'); inspect window $T" >&2
+    echo "error: $SPAWN_WT_ACQUIRE did not enter an isolated worktree within 60s (last seen '${last_seen:-none}': $last_reason; spawning project '$PROJ_ABS'); inspect window $T" >&2
     exit 1
   fi
+  [ "$BACKEND" != herdr ] || SPAWN_SLOT_LEASED=1
 
-  validate_spawn_worktree "treehouse get" "$T"
+  validate_spawn_worktree "$SPAWN_WT_ACQUIRE" "$T"
 
   # Claim the pool slot for this task. The interactive `treehouse get` sent to
-  # the pane above records only a process lease (Treehouse's durable
-  # `get --lease --lease-holder`, which bin/fm-home-seed.sh uses for secondmate
-  # homes, is not this path), so Treehouse cannot say which task a slot belongs
-  # to once that task's worker exits - and that is exactly when the slot is
-  # handed on and this task's worktree= line goes stale. The claim is what lets
+  # a non-Herdr pane above records only a process lease, so Treehouse cannot say
+  # which task a slot belongs to once that task's worker exits - and that is
+  # exactly when the slot is handed on and this task's worktree= line goes
+  # stale. A Herdr slot is durably leased instead, but the claim is written for
+  # it too, so teardown reads one ownership record for every slot. The claim is what lets
   # bin/fm-teardown.sh leave a slot that has since been reassigned untouched, so
   # a slot that cannot be claimed is refused here, at the cheapest point, rather
   # than launching a worker whose slot teardown could later release out from
@@ -4527,11 +4582,10 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
 fi
 
 # Re-assert the durable task copy after either treehouse acquisition or endpoint
-# adoption. This also updates Herdr's restored pane shell before any harness is
-# started, so a later host restart inherits the task worktree rather than the
-# tab's original project directory.
+# adoption, then prove the folder a Herdr restart would bring the pane back into.
 spawn_enter_recorded_worktree
 spawn_assert_agent_worktree
+spawn_assert_restore_worktree
 
 # Pre-register Claude's workspace trust for the directory this launch starts in,
 # at the first point that directory is known and before any per-task state is

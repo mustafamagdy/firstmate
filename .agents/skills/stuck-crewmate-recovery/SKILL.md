@@ -48,6 +48,16 @@ That reclaim is the owning home's operation only, and a secondmate is the one ex
 Do not use a fresh generic spawn while the recorded worktree is unaccounted for, because allocating another worktree can split one task across two copies.
 If the worktree or ownership cannot be reconciled safely, leave all state intact and report the task failed or blocked with the conflicting evidence.
 
+## A live worker outside its recorded worktree
+
+The session-start digest's `endpoint: wrong-folder` line, a `blocked:` crew-state line naming the pane's folder, and a monitoring notification that a worker is outside its recorded worktree all mean the same thing: a live agent is working in a folder other than the worktree its task record names, usually after a Herdr restore put it back in its launch folder.
+That worker is never healthy, and every write it makes lands in the wrong folder, so act before steering it toward anything else.
+
+1. Stop it at once with `FM_HOME=<this-firstmate-home> bin/fm-control.sh <task-id> interrupt`.
+2. Inspect the wrong folder read-only, for example `git -C <folder> status --short`, to learn whether the worker already changed it.
+3. Never clean, revert, commit, or otherwise write to that folder; if it holds changes the worker made, report the folder and those changes to the captain under `AGENTS.md` section 9 and leave them untouched.
+4. Relaunch the worker in its recorded worktree with `FM_HOME=<this-firstmate-home> bin/fm-control.sh <task-id> relaunch --note '<progress so far>'`, which starts the replacement in that worktree rather than the pane's current folder.
+
 ## A live crewmate claiming the pipeline is dead
 
 This is the inverse of the dead-endpoint case above: the worker is alive and the pipeline it declares dead usually is too.

@@ -148,7 +148,11 @@
 #      backend's pane busy state, then the resolved status declaration
 #      when its verb maps to a recognized run-state. Decision-only events such as
 #      `resolved` never become current state or detail.
-#   5. Missing meta or torn-down worktree: report unknown · none. If no run is
+#   5. A live local endpoint whose foreground folder is outside its recorded
+#      worktree reports blocked · pane ahead of steps 2 to 4, because it may act
+#      on the wrong copy whatever its run says (fm_backend_endpoint_folder_state
+#      owns the read; secondmates and unreadable endpoints are skipped).
+#   6. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log. On tmux and herdr, which own a
 #      recovery-grade classifier, only its positive death evidence reads as gone
@@ -339,6 +343,21 @@ crew_busy_verdict() {  # <target>
   tail40=$(fm_backend_capture "$TASK_BACKEND" "$1" 40 "$EXPECTED_LABEL" 2>/dev/null) || tail40=''
   fm_busy_classify "$TASK_BACKEND" "$1" "$HARNESS" "$ID" "$STATE" "$tail40"
 }
+
+# --- live endpoint outside its recorded worktree ----------------------------
+# Ahead of every run-step and pane verdict: a live worker running outside its
+# recorded worktree (a Herdr pane a restart put back in its launch folder) may
+# act on the wrong copy whatever its run reports, so it is never healthy.
+# fm_backend_endpoint_folder_state owns the read; only a positive `outside`
+# answer reports, and a dead, unreadable, or unverified endpoint falls through.
+if [ "$KIND" != secondmate ] && [ -n "$BACKEND_TARGET" ] && [ -n "$WT" ] && [ -d "$WT" ]; then
+  FOLDER_STATE=$(fm_backend_endpoint_folder_state "$TASK_BACKEND" "$BACKEND_TARGET" "$WT" 2>/dev/null || true)
+  case "$FOLDER_STATE" in
+    outside\ *)
+      emit blocked pane "worker running outside its recorded worktree (folder: ${FOLDER_STATE#outside }; recorded worktree: $WT); recover it before it acts on the wrong copy, and leave that folder untouched"
+      ;;
+  esac
+fi
 
 # --- no-mistakes run lookup (authoritative when a run matches this branch) --
 # trim, strip_quotes, the bounded nm_run call, nm_field's TOON parse, and the
