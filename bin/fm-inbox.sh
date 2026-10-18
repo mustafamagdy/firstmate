@@ -470,7 +470,7 @@ queue_note() {
 }
 
 cmd_note() {
-  local body json=0 request_id=""
+  local body json=0 request_id="" rc=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --json) json=1; shift ;;
@@ -495,7 +495,11 @@ cmd_note() {
   else
     body="$*"
   fi
-  queue_note text "$body" "" "$request_id" "$json"
+  queue_note text "$body" "" "$request_id" "$json" || rc=$?
+  # A saved note is the captain answering (directly, from a topic tab, or by
+  # voice), so it ends any captain-wait episode (bin/fm-captain-wait.sh).
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SELF_DIR/fm-captain-wait.sh" clear </dev/null >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 cmd_announce() {

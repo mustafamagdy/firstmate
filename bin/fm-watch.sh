@@ -2720,6 +2720,12 @@ while :; do
   # status lines before this cycle can exit on a wake. Off costs one file test.
   [ ! -e "$CONFIG/fleet-ledger" ] || FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG "$SCRIPT_DIR/fm-fleet-ledger.sh" capture || true
 
+  # Opt-in captain-wait phone reminder (bin/fm-captain-wait.sh): one bounded
+  # check while an episode is open or configured. Off costs two file tests.
+  if [ -e "$CONFIG/captain-ntfy" ] || [ -e "$STATE/.captain-wait" ]; then
+    FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG "$SCRIPT_DIR/fm-captain-wait.sh" tick || true
+  fi
+
   if [ "$(age_of "$STATE/home-summary.json")" -ge "$HOME_SUMMARY_INTERVAL" ]; then
     home_summary_refresh_detached
   fi

@@ -1,0 +1,17 @@
+# config/captain-ntfy - the captain-wait phone reminder (bin/fm-captain-wait.sh).
+# Copy this into a local, gitignored config/captain-ntfy and edit. With the file
+# absent the reminder is off and silent.
+#
+# key=value lines; lines starting with # are comments.
+#   url=<base URL>     ntfy server, such as https://ntfy.sh
+#   topic=<topic>      the private topic your phone subscribes to (a secret)
+#   env-file=<path>    file with NTFY_URL= and NTFY_TOPIC= lines, used for
+#                      whichever of url and topic this file leaves out; ~/ and
+#                      absolute paths work, a relative path is read from the home
+#   delay=<seconds>    captain quiet time before the reminder (default 300)
+#
+# Keep the topic out of anything tracked. Pointing env-file at an owner-only
+# file outside the repo keeps it out of config/ as well.
+
+env-file=~/.config/projects/firstmate/ntfy.env
+delay=300

@@ -1008,6 +1008,11 @@ command_hold() {
   [ -n "$(body_hold_set_timestamp "$(show_field_value "$show" body)")" ] \
     || fail "task $id lost its hold-set stamp while being held"
   publish_parent_hold "$id" "$occurrence" needs-decision "$reason"
+  # A new, undeferred captain call opens the captain-wait reminder's episode
+  # (bin/fm-captain-wait.sh). Best-effort: it never affects the hold.
+  if [ "$preserve_hold_set" -eq 0 ] && [ -z "$until" ]; then
+    FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-captain-wait.sh" open "$id" </dev/null >/dev/null 2>&1 || true
+  fi
   printf '%s\n' "$id"
 }
 
