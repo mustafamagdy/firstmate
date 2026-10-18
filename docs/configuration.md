@@ -11,7 +11,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | Task windows and worker tools | [Runtime backend](#runtime-backend-configbackend--fm_backend) and [harness support](#harness-support) |
 | Worker permissions, accounts, or environment | [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), and [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist) |
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
-| Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
+| Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), [Calm preference](#calm-preference-configcalm), and [captain-wait phone reminder](#captain-wait-phone-reminder-configcaptain-ntfy) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) and [linked projects](#linked-projects-configlinked-projects) |
 | Per-run overrides and tuning | [Environment variables](#environment-variables) |
 
@@ -557,6 +557,36 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the current channel reference, [`verification/supervision.md`](verification/supervision.md#wedge-alarm-channels) for active evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
+
+## Captain-wait phone reminder (config/captain-ntfy)
+
+The optional local, gitignored `config/captain-ntfy` file opts a primary home into one [ntfy](https://ntfy.sh) push notification when the captain has left a question unanswered for a set delay.
+With the file absent the reminder is off and silent: nothing is recorded, sent, or logged.
+A secondmate home is always off, because it reaches the captain through main.
+
+The file holds `key=value` lines, and `#` starts a comment line:
+
+| Key | Holds |
+| --- | --- |
+| `url` | ntfy server base URL, such as `https://ntfy.sh`. |
+| `topic` | The private topic the captain's phone subscribes to. |
+| `env-file` | Optional path to a file with `NTFY_URL=` and `NTFY_TOPIC=` lines (optional `export` and quotes), used for whichever of `url` and `topic` the config file leaves out; `~/` and absolute paths work, and a relative path is read from the home. The file is read, never sourced. |
+| `delay` | Seconds of captain quiet before the reminder; `300` (5 minutes) when unset. |
+
+Treat the topic as a secret: anyone who knows it can read and post to it.
+`bin/fm-captain-wait.sh` never prints, logs, or passes the topic on a command line; curl receives the URL on its config stdin.
+Keep the topic out of tracked files, and prefer `env-file` pointing outside the repo, such as `~/.config/projects/firstmate/ntfy.env` with owner-only permissions.
+See [`examples/captain-ntfy`](examples/captain-ntfy) for a copyable config.
+
+Waiting starts from a durable captain hold, never from the chat text: a `bin/fm-captain-hold.sh hold` that starts a new hold without `--until` opens a waiting episode, and the primary Claude Code session's next turn end (its Stop hook) starts the clock.
+Repeating an active hold or deferring one with `--until` opens nothing, so a parked decision never pings again.
+Waiting ends unsent when the captain submits any prompt to the primary session, queues an inbox note (which is also how topic tabs and the voice relay answer), or every question in the episode is no longer open; turns the harness or fleet machinery started do not count as a captain reply.
+Only a lock-owning primary Claude Code session opens episodes, since its Stop hook is what starts the clock.
+
+The watcher checks the episode on each poll cycle, so the reminder fires while the session is idle; an unsent episode counts as supervision need, which keeps a watcher armed for it.
+Past the delay it POSTs once with the title "Firstmate is waiting for you" and a one-line body counting the open questions, such as "2 questions are waiting for your answer.".
+Each episode sends at most one notification; a question held while one is open joins it, and a new episode needs a captain reply first.
+A failed POST never blocks supervision: each attempt is bounded to a few seconds, a failure is retried at most twice a minute apart and then given up, and failures are recorded only in the home-local `state/.captain-wait.log`.
 
 ## Trace context propagation (config/trace-context / FM_TRACE_CONTEXT)
 

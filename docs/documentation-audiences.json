@@ -345,6 +345,10 @@
       "audience": "maintainer-architecture"
     },
     {
+      "path": "docs/examples/captain-ntfy",
+      "audience": "operator-example"
+    },
+    {
       "path": "docs/examples/crew-dispatch.json",
       "audience": "operator-example"
     },
