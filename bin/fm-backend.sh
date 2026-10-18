@@ -991,6 +991,41 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
   esac
 }
 
+# fm_backend_endpoint_folder_state: the single READ-ONLY owner of "is this
+# live endpoint working in its recorded worktree?". Prints exactly one of:
+#   inside            - the foreground folder is the worktree or a folder under it.
+#   outside <folder>  - the foreground folder is somewhere else, for example the
+#                       project's primary checkout a Herdr restore put the pane
+#                       back into; the worker may act on the wrong copy, so the
+#                       endpoint is never healthy.
+#   unknown           - the folder could not be read (server down, pane gone, or
+#                       a reply without folders); liveness owns those outcomes.
+#   unverified        - the backend has no folder probe here.
+# Herdr is the backend that restores a pane into a saved folder after a restart
+# (docs/herdr-backend.md "Restart and liveness behavior"), so it is the one
+# probed; the others report unverified rather than guess. Never starts a server.
+fm_backend_endpoint_folder_state() {  # <backend> <target> <worktree>
+  local backend=$1 target=$2 worktree=$3 folders foreground wt_real seen_real
+  [ -n "$worktree" ] || { printf 'unknown\n'; return 0; }
+  case "$backend" in
+    herdr)
+      fm_backend_source herdr || { printf 'unknown\n'; return 0; }
+      folders=$(fm_backend_herdr_folders "$target") || { printf 'unknown\n'; return 0; }
+      foreground=${folders#*$'\t'}
+      ;;
+    *)
+      printf 'unverified\n'
+      return 0
+      ;;
+  esac
+  wt_real=$(CDPATH='' cd -- "$worktree" 2>/dev/null && pwd -P) || wt_real=$worktree
+  seen_real=$(CDPATH='' cd -- "$foreground" 2>/dev/null && pwd -P) || seen_real=$foreground
+  case "$seen_real" in
+    "$wt_real"|"$wt_real"/*) printf 'inside\n' ;;
+    *) printf 'outside %s\n' "$foreground" ;;
+  esac
+}
+
 # fm_backend_agent_state: the single recovery-grade agent/endpoint state
 # contract. It is deliberately richer than fm_backend_target_exists's cheap
 # pane-presence read and prints exactly one of:

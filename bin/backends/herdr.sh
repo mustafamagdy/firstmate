@@ -3065,18 +3065,31 @@ fm_backend_herdr_target_ready() {  # <target>
 # any error. Mirrors tmux's pane_current_path poll used for worktree-path
 # discovery after `treehouse get`.
 #
-# Verified pitfall: `pane get`'s `.result.pane.cwd` is the pane's cwd AT
-# CREATION TIME - the top-level shell's cwd - and does NOT update when that
-# shell `cd`s or enters a subshell (as `treehouse get` does). Reading it here
-# would make fm-spawn.sh's worktree-discovery poll never see the pane "leave"
-# the project directory, since `cwd` stays frozen at the original path forever.
-# `.result.pane.foreground_cwd` tracks the ACTUALLY RUNNING foreground
-# process's cwd instead, which is what changes when `treehouse get` enters its
-# worktree subshell - confirmed live against a real treehouse acquisition.
+# `pane get` reports two folders. `.result.pane.cwd` is the pane's top-level
+# shell's cwd: it follows that shell's own `cd`, but not a nested subshell's
+# (an interactive `treehouse get` opens one), and it is the folder Herdr saves
+# in its session file and restores the pane into after a server or host
+# restart. `.result.pane.foreground_cwd` is the running foreground process's
+# cwd, which is where the agent actually works, so worktree discovery and the
+# launch assertion read it here. fm_backend_herdr_folders reads both.
 fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
     | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+}
+
+# fm_backend_herdr_folders: READ-ONLY report of a pane's restore folder (the
+# top-level shell's `cwd`) and its foreground folder, as one line
+# "<cwd>\t<foreground_cwd>". Never starts a server, so liveness probes can call
+# it. Fails when the target is malformed, its server is not running, the pane
+# cannot be read, or either folder is missing from the reply.
+fm_backend_herdr_folders() {  # <target>
+  local out
+  fm_backend_herdr_target_observable "$1" || return 1
+  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
+    | jq -r '.result.pane | select((.cwd // "") != "" and (.foreground_cwd // "") != "") | "\(.cwd)\t\(.foreground_cwd)"' 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,

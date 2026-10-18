@@ -50,11 +50,14 @@
 #                       every state/*.meta, a bounded state/*.status tail,
 #                       the away posture (state/.afk-contract and the legacy
 #                       state/.afk daemon flag), and a cheap per-task
-#                       endpoint-liveness read, each bounded and crash-
-#                       isolated so one task's read can never abort the
+#                       endpoint-liveness read, plus a worktree-folder read
+#                       of each live worker endpoint that reports
+#                       `endpoint: wrong-folder` instead of alive when it
+#                       runs outside its recorded worktree, each bounded and
+#                       crash-isolated so one task's read can never abort the
 #                       digest: read-only, always runs. The per-task reads
 #                       run serially, so with a wedged backend the stage's
-#                       ceiling is tasks x the per-read bound
+#                       ceiling is tasks x 2 x the per-read bound
 #                       (FM_SESSION_START_ENDPOINT_TIMEOUT, default 10s) and
 #                       can itself reach the digest's runtime bound.
 #   7. network checks - the result of the deferred network stage started back at
@@ -589,6 +592,17 @@ fm_session_start_endpoint_read() {  # <backend> <target> [expected-label]
   ' _ "$SCRIPT_DIR/fm-backend.sh" "$backend" "$target" "$label"
 }
 
+# fm_session_start_folder_read <backend> <target> <worktree>: the same bounded,
+# crash-isolated shape for fm_backend_endpoint_folder_state, so a live endpoint
+# working outside its recorded worktree is reported instead of read as alive.
+fm_session_start_folder_read() {  # <backend> <target> <worktree>
+  # shellcheck disable=SC2016  # Positional parameters expand inside the child bash, not here.
+  fm_run_timed "$ENDPOINT_TIMEOUT" bash -c '
+    . "$1"
+    fm_backend_endpoint_folder_state "$2" "$3" "$4"
+  ' _ "$SCRIPT_DIR/fm-backend.sh" "$1" "$2" "$3"
+}
+
 hash_file_sha256() {
   local file=$1 digest
   [ -f "$file" ] || return 1
@@ -900,17 +914,32 @@ for meta in "$STATE"/*.meta; do
     backend=$(fm_backend_of_meta "$meta")
     endpoint_rc=0
     fm_session_start_endpoint_read "$backend" "${target:-$window}" "fm-$id" || endpoint_rc=$?
-    # Only the timeout owner's own statuses mean the read itself failed: 124 is
-    # the bound firing and >=128 is a signal death. Every other nonzero status
-    # is the probe's own verdict that the endpoint is gone.
-    if [ "$endpoint_rc" -eq 0 ]; then
-      printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
-    elif [ "$endpoint_rc" -eq 124 ] || [ "$endpoint_rc" -ge 128 ]; then
-      printf 'endpoint: error (backend=%s window=%s - the endpoint read died or hit its %ss bound; the digest continued past it)\n' \
-        "$backend" "$window" "$ENDPOINT_TIMEOUT"
-    else
-      printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
+    # A live worker endpoint is also checked against its recorded worktree, so
+    # one a restart put back in another folder is never read as alive.
+    folder_state=
+    worktree=$(fm_meta_get "$meta" worktree)
+    if [ "$endpoint_rc" -eq 0 ] && [ -n "$worktree" ] && [ "$(fm_meta_get "$meta" kind)" != secondmate ]; then
+      folder_state=$(fm_session_start_folder_read "$backend" "${target:-$window}" "$worktree" 2>/dev/null) || folder_state=
     fi
+    case "$folder_state" in
+      outside\ *)
+        printf 'endpoint: wrong-folder (backend=%s window=%s folder=%s recorded worktree=%s - the live worker is running outside its recorded worktree and may act on the wrong copy; never healthy: recover it per stuck-crewmate-recovery and leave the wrong folder untouched)\n' \
+          "$backend" "$window" "${folder_state#outside }" "$worktree"
+        ;;
+      *)
+        # Only the timeout owner's own statuses mean the read itself failed: 124
+        # is the bound firing and >=128 is a signal death. Every other nonzero
+        # status is the probe's own verdict that the endpoint is gone.
+        if [ "$endpoint_rc" -eq 0 ]; then
+          printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
+        elif [ "$endpoint_rc" -eq 124 ] || [ "$endpoint_rc" -ge 128 ]; then
+          printf 'endpoint: error (backend=%s window=%s - the endpoint read died or hit its %ss bound; the digest continued past it)\n' \
+            "$backend" "$window" "$ENDPOINT_TIMEOUT"
+        else
+          printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
+        fi
+        ;;
+    esac
   else
     printf 'endpoint: unknown (no window recorded)\n'
   fi

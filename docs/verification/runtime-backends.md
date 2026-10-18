@@ -1864,6 +1864,45 @@ ok - real herdr 0.9.0 + pi 0.85.1: the registration left behind by a quit pi rea
 `tests/fm-crew-state.test.sh` pins the recovery classifier: a stale registration over a shell-only pane reports agent gone rather than alive or unreachable, and a stale `working` record never reports the pane working.
 A stale-registration pane is never a husk: create, reclaim, presentation recovery, and session cleanup keep refusing it, and only recovery reuses it.
 
+### Restore folder
+
+Measured 2026-10-18 on Linux x86_64 against Herdr 0.9.1 in an isolated `fm-lab-` session provisioned by `bin/fm-herdr-lab.sh`, with treehouse v3.1.2 locally and v2.0.1 (the CI pin) in a private throwaway pool.
+
+A lab session stopped and provisioned again restores each pane into its top shell's `cwd`, and a nested shell's folder is lost:
+
+```text
+after get: {"cwd":"<tmp>/project","foreground_cwd":"<tmp>/pool/.treehouse/project-7c19b1/1/project"}
+after cd: {"cwd":"<tmp>/pool/.treehouse/project-7c19b1/1/project","foreground_cwd":"<tmp>/pool/.treehouse/project-7c19b1/1/project"}
+after restart: {"cwd":"<tmp>/pool/.treehouse/project-7c19b1/1/project","foreground_cwd":"<tmp>/pool/.treehouse/project-7c19b1/1/project"}
+```
+
+The first line is an interactive `treehouse get` (nested shell); the second is the top shell after it `cd`s into the slot; the third is that pane after the restart.
+
+`tests/fm-herdr-restore-worktree-cwd-e2e.test.sh` refreshes the end-to-end proof through a real `bin/fm-spawn.sh` Herdr spawn and a lab restart:
+
+```text
+ok - real Herdr fresh spawn puts the top shell in the worktree and holds the slot with a durable lease
+ok - real Herdr restart restores the spawned worker pane inside its recorded worktree, slot still leased
+ok - real Herdr restart puts the old nested-shell shape back in its launch folder, and the folder check reports it outside
+evidence: herdr=0.9.1 treehouse=v3.1.2 default-session-tripwire=armed
+```
+
+The same script passes on the CI pin, Herdr 0.7.4 from `bin/fm-install-herdr.sh`, run with `HOME` and the XDG directories pointed at a scratch directory holding its own default server:
+
+```text
+evidence: herdr=0.7.4 treehouse=v3.1.2 default-session-tripwire=armed
+```
+
+The spawn's `treehouse get --lease --lease-holder <id>` and cleanup's `treehouse return --force` behave the same on the CI pin, run with `HOME` pointed at a scratch directory because v2.0.1 has no pool root setting:
+
+```text
+v2.0.1
+get --lease -> $HOME/.treehouse/r-7c6a8e/1/r
+1     leased       ~/.treehouse/r-7c6a8e/1/r  (held by rcwd)
+return rc=0
+1     available    ~/.treehouse/r-7c6a8e/1/r
+```
+
 ### Pane status authority across a relaunch
 
 Measured 2026-09-21 on Linux x86_64 against Herdr 0.9.1 (client protocol 22) and Pi 0.86.1, in an isolated `fm-lab-` session (`bin/fm-herdr-lab.sh`), after the same freeze was observed live on a relaunched Pi crewmate whose pane read `idle` while its validation pipeline ran.

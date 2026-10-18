@@ -3801,16 +3801,62 @@ test_kill_is_best_effort() {
 test_current_path_reads_cwd() {
   local dir log resp fb out
   dir="$TMP_ROOT/cwd"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # Verified pitfall (herdr-verification-p2.md): .result.pane.cwd is frozen at
-  # pane-creation time and never updates; .foreground_cwd tracks the live
-  # running process (e.g. a treehouse get subshell) and is what must be read.
+  # .result.pane.cwd is the pane's top-level shell folder, which a nested shell
+  # (an interactive treehouse get) does not move; .foreground_cwd tracks the
+  # live running process, which is where the agent works and what must be read.
   printf '{"result":{"pane":{"cwd":"/tmp/pane-creation-dir","foreground_cwd":"/tmp/fake-worktree"}}}\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_current_path default:w1:p2' "$ROOT" )
-  [ "$out" = "/tmp/fake-worktree" ] || fail "current_path should read foreground_cwd (the live process), not the frozen creation-time cwd, got '$out'"
+  [ "$out" = "/tmp/fake-worktree" ] || fail "current_path should read foreground_cwd (the live process), not the top shell's cwd, got '$out'"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''get'$'\x1f''w1:p2' "current_path did not call pane get"
-  pass "fm_backend_herdr_current_path: reads pane foreground_cwd (the live running process), not the frozen creation-time cwd"
+  pass "fm_backend_herdr_current_path: reads pane foreground_cwd (the live running process), not the top shell's cwd"
+}
+
+test_folders_reports_restore_and_foreground() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/folders"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"cwd":"/tmp/launch-dir","foreground_cwd":"/tmp/fake-worktree"}}}\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_folders default:w1:p2' "$ROOT" )
+  [ "$out" = $'/tmp/launch-dir\t/tmp/fake-worktree' ] || fail "folders should print '<cwd><TAB><foreground_cwd>', got '$out'"
+
+  dir="$TMP_ROOT/folders-missing"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"cwd":"/tmp/launch-dir"}}}\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_folders default:w1:p2' "$ROOT" >/dev/null
+  expect_code 1 $? "folders must fail rather than guess when pane get lacks a folder"
+  pass "fm_backend_herdr_folders: reports the restore folder and the foreground folder, and fails on a partial read"
+}
+
+# folder_state_case <name> <cwd> <foreground_cwd> <worktree> -> prints the verdict
+folder_state_case() {
+  local dir="$TMP_ROOT/folder-state-$1" fb
+  mkdir -p "$dir/responses"; : > "$dir/log"
+  printf '{"result":{"pane":{"cwd":"%s","foreground_cwd":"%s"}}}\n' "$2" "$3" > "$dir/responses/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  PATH="$fb:$PATH" FM_HERDR_LOG="$dir/log" FM_HERDR_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/fm-backend.sh"; fm_backend_endpoint_folder_state herdr default:w1:p2 "$1"' "$ROOT" "$4"
+}
+
+test_endpoint_folder_state_verdicts() {
+  local wt="$TMP_ROOT/folder-state-wt" proj="$TMP_ROOT/folder-state-proj" out
+  mkdir -p "$wt/sub" "$proj"
+  out=$(folder_state_case inside "$proj" "$wt" "$wt")
+  [ "$out" = inside ] || fail "a worker in its worktree must read inside, got '$out'"
+  out=$(folder_state_case subdir "$proj" "$wt/sub" "$wt")
+  [ "$out" = inside ] || fail "a worker in a worktree subfolder must read inside, got '$out'"
+  out=$(folder_state_case outside "$proj" "$proj" "$wt")
+  [ "$out" = "outside $proj" ] || fail "a restored worker in its launch folder must read 'outside <folder>', got '$out'"
+  out=$(folder_state_case prefix "$proj" "${wt}-other" "$wt")
+  [ "$out" = "outside ${wt}-other" ] || fail "a sibling folder sharing the worktree's name prefix must read outside, got '$out'"
+  out=$(folder_state_case partial "$proj" "" "$wt")
+  [ "$out" = unknown ] || fail "an unreadable folder must read unknown, never outside, got '$out'"
+  out=$(bash -c '. "$0/bin/fm-backend.sh"; fm_backend_endpoint_folder_state tmux fm-x:0 "$1"' "$ROOT" "$wt")
+  [ "$out" = unverified ] || fail "a backend without a folder read must say unverified, got '$out'"
+  pass "fm_backend_endpoint_folder_state: inside, subfolder, outside, name-prefix sibling, unreadable, and unverified backends"
 }
 
 # --- busy_state (semantic agent state) ---------------------------------------
@@ -6017,6 +6063,8 @@ test_capture_preserves_pane_read_failure
 test_send_key_normalizes_and_targets_pane
 test_kill_is_best_effort
 test_current_path_reads_cwd
+test_folders_reports_restore_and_foreground
+test_endpoint_folder_state_verdicts
 test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle
 test_busy_state_unknown_on_no_agent

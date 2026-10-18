@@ -676,12 +676,22 @@ A restored same-labeled tab with a missing pane or no registered agent is a husk
 Create replaces only a confidently dead or no-agent husk, creates the replacement before closing the old tab, and refuses live or unknown states.
 This prevents closing the workspace's last tab before a replacement exists.
 
+### Restore folder
+
+Herdr saves and restores each pane's top shell folder, which `pane get` reports as `cwd`, while the agent's own folder is `foreground_cwd`.
+A nested shell's `cd` never reaches the saved folder, so a worker whose top shell sat in its launch folder comes back there after a server or host restart.
+A fresh Herdr spawn therefore has the top shell itself take a durable Treehouse lease and `cd` into the leased slot, with no nested shell, and refuses to start the agent unless the top shell is in the recorded worktree; the lease keeps the slot reserved across the restart, and cleanup releases it.
+A pane spawned before this change, or any pane moved by hand, can still restore outside its worktree.
+Session start, crew state, and the watcher compare the agent's folder with the task's recorded worktree through `fm_backend_endpoint_folder_state` in `bin/fm-backend.sh`, and report a pane outside it as needing action, never as healthy.
+The watcher re-reads that folder on a bounded cadence ([`docs/configuration.md`](configuration.md) `FM_FOLDER_CHECK_SECS`) and notifies once per wrong folder.
+The `stuck-crewmate-recovery` skill owns the response.
+
 ### Stale agent registrations
 
 A registration alone never proves an agent.
 Herdr keeps a Pi registration after the Pi process has exited to a plain shell, whenever a nested interactive shell sits under the pane's top shell.
 In that case `agent get` still reports `agent=pi` with its last status.
-That nested shell is the crew shape `treehouse get` leaves behind (measured on Herdr 0.9.0 - [verification](verification/runtime-backends.md) "Stale agent registration"; upstream issue #4115).
+That nested shell is the crew shape an interactive `treehouse get` leaves behind, as on Herdr panes spawned before the restore-folder change above (measured on Herdr 0.9.0 - [verification](verification/runtime-backends.md) "Stale agent registration"; upstream issue #4115).
 
 So before a registered agent counts as live, the pane classifier reads `pane process-info` and the real process table.
 It uses the shared harness-process classifier in `bin/fm-agent-process-lib.sh`, the same rule the tmux adapter proves liveness with:

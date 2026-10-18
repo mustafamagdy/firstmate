@@ -1424,6 +1424,56 @@ EOF
   pass "herdr endpoint liveness is reported per task: alive, dead for exit 1, dead for any other probe status"
 }
 
+# make_fake_herdr_folders <fakebin> <pane> <foreground-folder>: a running
+# herdr whose `pane get <pane>` reports a live pane working in
+# <foreground-folder>, the shape a restored pane shows when Herdr brought it
+# back outside its recorded worktree.
+make_fake_herdr_folders() {
+  local fakebin=$1 pane=$2 folder=$3
+  cat > "$fakebin/herdr" <<SH
+#!/usr/bin/env bash
+set -u
+if [ "\${1:-}" = status ]; then
+  printf '{"server":{"running":true}}\n'
+  exit 0
+fi
+if [ "\${1:-}" = pane ] && [ "\${2:-}" = get ] && [ "\${3:-}" = "$pane" ]; then
+  printf '{"result":{"pane":{"pane_id":"%s","cwd":"%s","foreground_cwd":"%s"}}}\n' "$pane" "$folder" "$folder"
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$fakebin/herdr"
+}
+
+test_endpoint_wrong_folder_herdr() {
+  local rec root home fakebin out wt project
+  rec=$(new_world wrong-folder-herdr)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  wt="$home/slots/1/project"; project="$home/primary/project"
+  mkdir -p "$wt" "$project"
+
+  make_fake_herdr_folders "$fakebin" "p-moved" "$project"
+  printf 'window=sess:p-moved\nkind=ship\nbackend=herdr\nworktree=%s\n' "$wt" > "$home/state/task-moved.meta"
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "endpoint: wrong-folder (backend=herdr window=sess:p-moved folder=$project recorded worktree=$wt" \
+    "a live herdr worker outside its recorded worktree was not reported as wrong-folder"
+  assert_not_contains "$out" "endpoint: alive (backend=herdr window=sess:p-moved)" \
+    "a live herdr worker outside its recorded worktree was reported healthy"
+
+  make_fake_herdr_folders "$fakebin" "p-moved" "$wt"
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "endpoint: alive (backend=herdr window=sess:p-moved)" \
+    "a live herdr worker inside its recorded worktree was not reported alive"
+  assert_not_contains "$out" "endpoint: wrong-folder" "a worker inside its worktree was reported wrong-folder"
+
+  pass "herdr endpoint liveness reports a live worker outside its recorded worktree as wrong-folder, never alive"
+}
+
 test_endpoint_read_death_is_isolated_and_reported() {
   local rec root home fakebin out status=0
   [ -r /proc/self/stat ] || { echo "skip: /proc not readable (the read-death shape needs process ancestry)"; return 0; }
@@ -3038,6 +3088,7 @@ test_status_tail_line_cap
 test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
+test_endpoint_wrong_folder_herdr
 test_endpoint_read_death_is_isolated_and_reported
 test_endpoint_read_hang_is_bounded_and_reported
 test_endpoint_bound_rejects_padded_zero

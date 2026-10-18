@@ -326,6 +326,7 @@ TURNEND_CHURN_ABSORB_SECS=${FM_TURNEND_CHURN_ABSORB_SECS:-900}  # longest a task
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
+FOLDER_CHECK_SECS=${FM_FOLDER_CHECK_SECS:-60}  # min secs between one window's worktree-folder reads (wrong_folder_check)
 # A busy pane is unconditional proof of liveness with no built-in duration bound,
 # so a hung foreground call can remain hidden even while its rendered busy
 # footer changes every poll. BUSY_TURN_MAX_SECS bounds how long any busy pane
@@ -1497,6 +1498,65 @@ wedge_dead_record() {  # <window> <since-file> <triage-label> <idle-age> <pane-h
   fm_wake_append stale "$win" "$reason" || exit 1
   printf '%s %s' "$agent_state" "$id" > "$marker"
   clear_write_tracking "$key"
+  wake "$reason"
+}
+
+# wrong_folder_check: report, once, a live worker endpoint working outside its
+# recorded worktree - typically a Herdr pane a server or host restart put back in
+# its launch folder, where the resumed agent may act on the wrong copy. The read
+# is fm_backend_endpoint_folder_state (bin/fm-backend.sh), the single owner of the
+# verdict; this function owns only its cadence and its once-only report.
+# Cadence: at most one read per window per FOLDER_CHECK_SECS (the
+# .folder-checked- timestamp), so the ordinary poll stays cheap. A report needs
+# two consecutive `outside` reads naming the same folder (.wrong-folder-seen-),
+# so a single transient foreground read cannot alarm. The report marker
+# (.wrong-folder-reported-) records the folder with the agent incarnation it was
+# reported for (fm_busy_current_gen, else the folder alone), so a repeat is
+# absorbed while both match and a relaunched successor that lands outside again
+# is reported in full. An `inside` read clears both markers; `unknown` and
+# `unverified` change nothing, because they prove neither state.
+wrong_folder_check() {  # <window> <task>
+  local win=$1 task=$2 key meta worktree now last state folder seen gen id reported reason
+  [ -n "$task" ] || return 0
+  meta="$STATE/$task.meta"
+  [ -f "$meta" ] || return 0
+  [ "$(fm_meta_get "$meta" kind)" != secondmate ] || return 0
+  [ -z "$(fm_meta_get "$meta" remote_host)" ] || return 0
+  worktree=$(fm_meta_get "$meta" worktree)
+  [ -n "$worktree" ] && [ -d "$worktree" ] || return 0
+  key=$(window_key "$win")
+  now=$(date +%s)
+  last=$(cat "$STATE/.folder-checked-$key" 2>/dev/null || true)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $(( now - last )) -ge "$FOLDER_CHECK_SECS" ] || return 0
+  printf '%s' "$now" > "$STATE/.folder-checked-$key"
+  state=$(fm_backend_endpoint_folder_state "$(window_backend "$win")" "$win" "$worktree" 2>/dev/null) || state=unknown
+  case "$state" in
+    inside)
+      rm -f "$STATE/.wrong-folder-seen-$key" "$STATE/.wrong-folder-reported-$key"
+      return 0
+      ;;
+    outside\ *) folder=${state#outside } ;;
+    *) return 0 ;;
+  esac
+  seen=$(cat "$STATE/.wrong-folder-seen-$key" 2>/dev/null || true)
+  if [ "$seen" != "$folder" ]; then
+    printf '%s' "$folder" > "$STATE/.wrong-folder-seen-$key"
+    return 0
+  fi
+  id=$folder
+  if gen=$(fm_busy_current_gen "$STATE" "$task"); then
+    id="$gen $folder"
+  fi
+  reported=$(cat "$STATE/.wrong-folder-reported-$key" 2>/dev/null || true)
+  if [ "$reported" = "$id" ]; then
+    return 0
+  fi
+  reason="stale: $win (worker running outside its recorded worktree: folder $folder, recorded worktree $worktree; it may act on the wrong copy, so recover it per stuck-crewmate-recovery and leave that folder untouched; reported once while it stays there)"
+  # Append before the marker, as wedge_dead_record does, so a failed append is
+  # retried on the next read instead of absorbed by its own marker.
+  fm_wake_append stale "$win" "$reason" || exit 1
+  printf '%s' "$id" > "$STATE/.wrong-folder-reported-$key"
   wake "$reason"
 }
 
@@ -3060,6 +3120,7 @@ EOF
     # Steering-inbox loss detection runs before the secondmate stale
     # exemption below, because a mate's steers land in an inbox too.
     [ -z "$task" ] || inbox_steer_check "$w" "$task"
+    wrong_folder_check "$w" "$task"
     key=$(window_key "$w")
     last=$(status_declared_wait_line "$STATE/$task.status")
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then

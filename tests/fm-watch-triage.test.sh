@@ -3786,6 +3786,101 @@ test_gone_report_rearms_when_the_endpoint_comes_back() {
   pass "the once-only gone report re-arms when the endpoint comes back, and reports a later death again"
 }
 
+# A restored Herdr pane can come back outside its recorded worktree: Herdr
+# restores each pane into its saved top-shell folder. The watcher reads the
+# live foreground folder on its folder-check cadence, needs two identical
+# outside readings before it reports (a single transient read never wakes),
+# reports the same placement once, and forgets it once the pane is back
+# inside. The fake herdr serves the folder from a file so a case can move it.
+make_fake_herdr_folder_pane() {  # <fakebin> <folder-file>
+  local fakebin=$1 folder_file=$2
+  cat > "$fakebin/herdr" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-} \${2:-}" in
+  "status "*) printf '{"server":{"running":true}}\\n'; exit 0 ;;
+  "pane get")
+    folder=\$(cat "$folder_file")
+    printf '{"result":{"pane":{"pane_id":"p1","agent_status":"working","cwd":"%s","foreground_cwd":"%s"}}}\\n' "\$folder" "\$folder"
+    exit 0
+    ;;
+  "pane read") printf 'Working on it\\n'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$fakebin/herdr"
+}
+
+wrong_folder_round() {  # <state> <fakebin> <out> <exit|absorb> [folder-check-secs]
+  local state=$1 fakebin=$2 out=$3 mode=$4 every=${5:-0} pid cycles=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_FOLDER_CHECK_SECS="$every" FM_STALE_ESCALATE_SECS=999 FM_BUSY_TURN_MAX_SECS=999999 \
+    FM_WATCH_HANDLING_SUCCESSOR=1 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  if [ "$mode" = exit ]; then
+    wait_for_exit "$pid" 100 || { reap "$pid"; return 1; }
+    return 0
+  fi
+  while [ "$cycles" -lt 3 ]; do
+    wait_poll_cycle "$state" "$pid" 300 || { reap "$pid"; return 1; }
+    cycles=$((cycles + 1))
+  done
+  reap "$pid"
+}
+
+wrong_folder_wakes() {  # <state>
+  { cat "$1/.wake-queue" 2>/dev/null || true; } | grep -c 'outside its recorded worktree' || true
+}
+
+test_wrong_folder_pane_is_reported_once_and_cleared_inside() {
+  local dir state fakebin out window key wt project
+  dir=$(make_case wrong-folder); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  window="lab:p1"; key=$(printf '%s' "$window" | tr ':/.' '___')
+  wt="$dir/slots/1/project"; project="$dir/primary/project"
+  mkdir -p "$wt" "$project"
+  printf '%s' "$project" > "$dir/folder"
+  make_fake_herdr_folder_pane "$fakebin" "$dir/folder"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=herdr\nworktree=%s\n' "$window" "$wt" > "$state/moved.meta"
+  printf 'working: started\n' > "$state/moved.status"
+  printf '%s' "$(seen_sig "$state/moved.status")" > "$state/.seen-moved_status"
+
+  # With the cadence holding the watcher to one reading, a single outside
+  # reading is only a first sighting and never wakes.
+  wrong_folder_round "$state" "$fakebin" "$out" absorb 999 \
+    || fail "the watcher stopped on a single outside reading: $(cat "$out")"
+  [ "$(wrong_folder_wakes "$state")" -eq 0 ] \
+    || fail "a single outside reading was reported: $(cat "$state/.wake-queue")"
+  [ "$(cat "$state/.wrong-folder-seen-$key" 2>/dev/null)" = "$project" ] \
+    || fail "the first outside reading was not recorded as a sighting"
+
+  # The next reading confirms it, and the watcher reports it.
+  : > "$out"
+  wrong_folder_round "$state" "$fakebin" "$out" exit \
+    || fail "a pane outside its recorded worktree was never reported: $(cat "$out")"
+  [ "$(wrong_folder_wakes "$state")" -eq 1 ] \
+    || fail "a pane outside its recorded worktree was not reported exactly once: $(cat "$state/.wake-queue" 2>/dev/null)"
+  grep -F "folder $project, recorded worktree $wt" "$state/.wake-queue" >/dev/null \
+    || fail "the wrong-folder report did not name the folder and recorded worktree: $(cat "$state/.wake-queue")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the wrong-folder report"
+
+  # The same placement is not reported again.
+  : > "$out"
+  wrong_folder_round "$state" "$fakebin" "$out" absorb \
+    || fail "the watcher stopped on a wrong-folder placement it had already reported: $(cat "$out")"
+  grep -F 'outside its recorded worktree' "$out" >/dev/null \
+    && fail "an already-reported wrong-folder placement woke again: $(cat "$out")"
+
+  # Back inside its worktree, the pane's markers are forgotten.
+  printf '%s' "$wt" > "$dir/folder"
+  wrong_folder_round "$state" "$fakebin" "$out" absorb \
+    || fail "the watcher stopped on a pane inside its worktree: $(cat "$out")"
+  [ ! -e "$state/.wrong-folder-seen-$key" ] && [ ! -e "$state/.wrong-folder-reported-$key" ] \
+    || fail "a pane back inside its worktree kept its wrong-folder markers"
+  pass "a live pane outside its recorded worktree is reported once after two readings, and cleared once back inside"
+}
+
 # The swallow the once-marker must be bound against: death #1 is reported, then a
 # replacement launches into the same window - churning the pane hash, which
 # resets the stale suppressor, wedge timer and escalation count while NO reset
@@ -6681,6 +6776,7 @@ test_wedge_escalation_resets_when_pane_becomes_active
 test_gone_endpoint_reports_once_instead_of_escalating_forever
 test_live_and_unproven_endpoints_still_wedge_escalate
 test_gone_report_rearms_when_the_endpoint_comes_back
+test_wrong_folder_pane_is_reported_once_and_cleared_inside
 test_second_death_after_a_same_window_relaunch_reports_in_full
 test_identical_dead_display_of_a_successor_still_reports
 test_term_stops_a_watcher_blocked_inside_a_poll

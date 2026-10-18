@@ -247,6 +247,12 @@ case "${1:-}" in
           printf '{"error":{"code":"pane_not_found","message":"no such pane"}}\n'
           exit 1
         fi
+        # FM_FAKE_HERDR_FOREGROUND_CWD adds the pane's folders: the top shell's
+        # (FM_FAKE_HERDR_CWD, default /) and the foreground process's.
+        if [ -n "${FM_FAKE_HERDR_FOREGROUND_CWD:-}" ]; then
+          printf '{"result":{"pane":{"pane_id":"%s","cwd":"%s","foreground_cwd":"%s"}}}\n' "${3:-}" "${FM_FAKE_HERDR_CWD:-/}" "$FM_FAKE_HERDR_FOREGROUND_CWD"
+          exit 0
+        fi
         printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "${3:-}"
         exit 0 ;;
       process-info)
@@ -328,6 +334,8 @@ reset_fakes() {
   FM_FAKE_TMUX_MISSING=0
   FM_FAKE_TMUX_UNREADABLE=0
   FM_FAKE_HERDR_BUSY=0
+  FM_FAKE_HERDR_FOREGROUND_CWD=""
+  FM_FAKE_HERDR_CWD=""
   FM_FAKE_HERDR_MISSING=0
   FM_FAKE_HERDR_READ_FAIL=0
   FM_FAKE_HERDR_HUSK=0
@@ -353,7 +361,7 @@ reset_fakes() {
   FM_FAKE_GERRIT_READ_LOG=
   unset FM_FAKE_PR_47_STATE FM_FAKE_PR_47_MERGED FM_FAKE_PR_48_STATE FM_FAKE_PR_48_MERGED
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_BUSY_TEXT FM_FAKE_TMUX_MISSING FM_FAKE_TMUX_UNREADABLE
-  export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_READ_FAIL FM_FAKE_HERDR_HUSK FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_HERDR_PROCESS FM_FAKE_HERDR_SHELL_PID FM_FAKE_CI_LOGS
+  export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_FOREGROUND_CWD FM_FAKE_HERDR_CWD FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_READ_FAIL FM_FAKE_HERDR_HUSK FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_HERDR_PROCESS FM_FAKE_HERDR_SHELL_PID FM_FAKE_CI_LOGS
   export FM_FAKE_DAEMON_DOWN FM_FAKE_DAEMON_TIMEOUT FM_FAKE_DAEMON_PROBE_LOG FM_FAKE_AXI_HOME
   export FM_FAKE_AXI_HOME_ERROR FM_FAKE_AXI_STATUS_RUN_ERROR FM_FAKE_AXI_STATUS_ERROR
   export FM_FAKE_PR_STATE FM_FAKE_PR_MERGED FM_FAKE_PR_READ_FAIL FM_FAKE_PR_READ_LOG FM_FAKE_PR_STATE_AXI
@@ -2590,6 +2598,35 @@ test_no_run_herdr_unknown_uses_backend_capture() {
   assert_contains "$out" "source: pane" "herdr native busy -> pane source"
   assert_contains "$out" "herdr-native" "the herdr verdict names its native source"
   pass "herdr's native busy verdict reads working with no record present"
+}
+
+# A Herdr pane a restart put back in its launch folder resumes its agent there:
+# the live worker may act on the wrong copy, so it reads blocked, never working,
+# even while its agent is busy; the same pane in its worktree reads normally.
+test_herdr_worker_outside_worktree_reads_blocked() {
+  command -v jq >/dev/null 2>&1 || { pass "herdr wrong-folder read skipped without jq"; return; }
+  reset_fakes
+  local d; d=$(new_case herdr-wrong-folder)
+  make_repo_on_branch "$d/wt" fm/feat-wf
+  mkdir -p "$d/project"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-wf.meta" "window=default:w1:p2" "worktree=$d/wt" "kind=ship" \
+    "backend=herdr" "harness=claude"
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_TMUX_MISSING=1
+  FM_FAKE_HERDR_BUSY=1
+  FM_FAKE_HERDR_AGENT_STATUS=working
+  FM_FAKE_HERDR_CWD="$d/project"
+  FM_FAKE_HERDR_FOREGROUND_CWD="$d/project"
+  local out; out=$(run_crew_state "$d" feat-wf)
+  assert_contains "$out" "state: blocked" "a busy worker outside its worktree must read blocked"
+  assert_contains "$out" "outside its recorded worktree (folder: $d/project; recorded worktree: $d/wt)" \
+    "the verdict names the wrong folder and the recorded worktree"
+  FM_FAKE_HERDR_FOREGROUND_CWD="$d/wt"
+  out=$(run_crew_state "$d" feat-wf)
+  assert_contains "$out" "state: working" "the same busy worker inside its worktree reads working"
+  pass "a live herdr worker outside its recorded worktree reads blocked; inside it reads normally"
 }
 
 # Regression (2026-09 G7 stale-claim incident): a herdr CLI that errors or
@@ -5614,6 +5651,7 @@ test_no_run_launch_prompt_parked_is_not_working
 test_no_run_footer_text_alone_is_not_working
 test_no_run_grok_uses_isolated_fallback
 test_no_run_herdr_unknown_uses_backend_capture
+test_herdr_worker_outside_worktree_reads_blocked
 test_no_run_herdr_cli_failure_reads_unreachable_not_gone
 test_no_run_herdr_alive_with_failed_read_stays_live
 test_no_run_herdr_husk_dead_still_reads_gone
