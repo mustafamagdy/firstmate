@@ -547,7 +547,7 @@ grok 0.2.103 (89c3d36fb6f1) [stable]
 | Harness | Exact opt-in command | Observed guarantee |
 | --- | --- | --- |
 | Claude | `FM_CLAUDE_LIVE_E2E=1 tests/fm-claude-stop-autoarm-live-e2e.test.sh` | The tracked `SessionStart` hook reclaimed a stale owner before two Stop-owned cycles, and a competing live owner prevented arm, rewake, epoch write, or lock replacement. |
-| Codex | `FM_CODEX_LIVE_E2E=1 tests/fm-codex-continuity-live-e2e.test.sh` | The one-second foreground checkpoint returned without switching to the arm wrapper. |
+| Codex | `FM_CODEX_LIVE_E2E=1 tests/fm-codex-continuity-live-e2e.test.sh` | See [current Codex unsafe-final verification](#codex-unsafe-final-prevention). |
 | OpenCode | `FM_OPENCODE_LIVE_E2E=1 tests/fm-opencode-primary-live-e2e.test.sh` | A verified successor existed before prompt handling, with no model re-arm or turn-end fallback. |
 | Pi | `FM_PI_LIVE_E2E=1 FM_PI_LIVE_WATCH_ONLY=1 tests/fm-pi-primary-live-e2e.test.sh` | Three consecutive actionable closes each produced a ledger-linked successor, and an intentional stopped-chain failure still raised the outage alarm. |
 | omp | `FM_OMP_LIVE_E2E=1 tests/fm-omp-primary-live-e2e.test.sh` | One initial `fm_watch_arm_omp` invocation (the openai-codex model reaches extension tools through omp's `xd://` virtual-file bridge, a `write` to `xd://fm_watch_arm_omp`, counted as the same invocation) started a live watcher; an actionable close spawned a ledger-linked successor and woke main exactly once; the lab is reaped by path, and omp 18.1.11 did not exit within 30s of its rpc stdin closing, recorded as a note. omp 18.1.11, 2026-09-05. |
@@ -602,6 +602,34 @@ ok - a resurfacing handling successor stays alive and supervises instead of goin
 ok - unacknowledged recovery is announced at most once per generation and the successor stays alive
 FM_TEST_SUMMARY total=1 failed=0 skipped_gate=0 duration_ms=59357
 ```
+
+### Codex unsafe-final prevention
+
+Verified on 2026-10-20 with codex-cli 0.159.3 on Linux in named non-default Herdr labs.
+The installed native runtime invoked Stop with `stop_hook_active` false, true, true and honored each exit-2 refusal.
+The enabled-hook control returned exit 0 while a yielded checkpoint was still live; a topic request and mate outcome added after that process stopped remained unanswered.
+Explicit Codex mode refused the same unsafe finals, and the existing foreground continuation handled two late topic requests and a mate outcome exactly once, including after checkpoint expiration and after the watcher received TERM.
+The test verified two durable replies, inbox ACKs, an empty wake queue after the required generation/receipt ACKs, ordinary Enter submission without Escape, and explicit `/quit` with watcher cleanup.
+
+With the named lab helper overrides supplied in the environment where required, the refresh command is:
+
+```sh
+FM_CODEX_LIVE_E2E=1 bin/fm-test-run.sh tests/fm-codex-continuity-live-e2e.test.sh
+```
+
+Observed native results:
+
+```text
+harness: codex-cli 0.159.3
+ok - codex-cli 0.159.3: live-PID control ended blind and stranded both late handoffs
+ok - codex-cli 0.159.3: repeated unsafe finals refused; two late topics and mate outcome handled once with receipt ACKs (fixed)
+ok - codex-cli 0.159.3: repeated unsafe finals refused; two late topics and mate outcome handled once with receipt ACKs (failed-watcher)
+ok - codex-cli 0.159.3: ordinary Enter submits user input during foreground supervision; explicit /quit exits with watcher cleanup
+# all fm-codex-continuity live checks passed (codex-cli 0.159.3)
+```
+
+This verifies the [enabled-hook unsafe-final boundary](../turnend-guard.md#claude-and-codex-blocking) and actual foreground handling, not a background completion callback or delivery after explicit cancellation.
+The native run observed quiet checkpoints return 137; the unchanged wrapper's quiet-124 regression remains a separate limitation and was not converted into a success by this guard change.
 
 The Codex foreground-checkpoint behavior was exercised hermetically on 2026-09-14 with real watcher processes and isolated home state.
 That run observed an announced recovery remain announced through a quiet checkpoint, a never-announced generation surface once, and a durable wake appended during a live checkpoint resurface.

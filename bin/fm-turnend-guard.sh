@@ -47,8 +47,14 @@
 # are unchanged everywhere else, including for a dead daemon pid or a beacon
 # older than AFK_GRACE, which still block.
 #
-# Loop-guard, codex/Grok (default) mode: never block twice in the same turn.
-# Codex uses stop_hook_active and Grok uses stopHookActive; typed camel-case
+# Loop-guard, Grok/default mode: never block twice in the same turn.
+# Explicit --codex mode instead refuses every unsafe final, including a Stop
+# with stop_hook_active=true. Codex 0.159.3 supports repeated refusals; the
+# previous one-block policy and live-checkpoint allowance could strand work.
+# This guard starts no watcher, sleeps on no hook, and manufactures no callback.
+# The existing foreground protocol owns one tool continuation at a time; native
+# user input and explicit cancellation remain available.
+# Default callers use stop_hook_active and Grok uses stopHookActive; typed camel-case
 # takes precedence when both spellings are present. A true value means the
 # current stop attempt already follows a block, so this guard always allows it.
 # Passive harness adapters provide their own one-follow-up guard before calling
@@ -100,6 +106,7 @@ GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 CLAUDE_MODE=0
 CURSOR_MODE=0
+CODEX_MODE=0
 SYNC_WAIT_MS=${FM_CLAUDE_AUTOARM_SYNC_WAIT_MS:-800}
 EPOCH_FRESH=${FM_CLAUDE_AUTOARM_EPOCH_FRESH:-15}
 BLOCK_BUDGET=${FM_CLAUDE_TURNEND_BLOCK_BUDGET:-3}
@@ -111,7 +118,8 @@ for arg in "$@"; do
   case "$arg" in
     --claude) CLAUDE_MODE=1 ;;
     --cursor) CURSOR_MODE=1 ;;
-    *) echo "usage: $(basename "$0") [--claude|--cursor]" >&2; exit 2 ;;
+    --codex) CODEX_MODE=1 ;;
+    *) echo "usage: $(basename "$0") [--claude|--cursor|--codex]" >&2; exit 2 ;;
   esac
 done
 
@@ -177,7 +185,7 @@ STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '
   else false
   end
 ' 2>/dev/null) || exit 0
-if [ "$CLAUDE_MODE" -eq 0 ] && [ "$STOP_HOOK_ACTIVE" = "true" ]; then
+if [ "$CLAUDE_MODE" -eq 0 ] && [ "$CODEX_MODE" -eq 0 ] && [ "$STOP_HOOK_ACTIVE" = "true" ]; then
   exit 0
 fi
 
@@ -198,7 +206,7 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 # --- the actual predicate ----------------------------------------------------
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
-if [ "$CLAUDE_MODE" -eq 1 ]; then
+if [ "$CLAUDE_MODE" -eq 1 ] || [ "$CODEX_MODE" -eq 1 ]; then
   # shellcheck source=bin/fm-session-lock-lib.sh
   . "$SCRIPT_DIR/fm-session-lock-lib.sh"
 fi
@@ -217,6 +225,9 @@ budget_reset() {
 }
 
 fm_supervision_status "$STATE" "$GRACE"
+if [ "$CODEX_MODE" -eq 1 ] && fm_supervision_pending_handoffs "$STATE"; then
+  FM_SUP_NEEDED=true
+fi
 if [ "$FM_SUP_NEEDED" = false ]; then
   [ -e "$FAILURE_NOTICE" ] || budget_reset
   exit 0
@@ -229,7 +240,9 @@ allow_supervised_stop() {
   exit 2
 }
 
-if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+# A live bounded checkpoint does not prove a post-turn consumer on Codex.
+# Its model must keep the foreground tool continuation open until completion.
+if [ "$CODEX_MODE" -eq 0 ] && fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   allow_supervised_stop
 fi
 
@@ -289,10 +302,22 @@ block_stop() {
 # stealing ownership, so blocking its Stop would create an impossible loop.
 # Report the ownership conflict as a diagnostic and let this turn end safely;
 # the owning session remains responsible for restoring the watcher.
-if [ "$CLAUDE_MODE" -eq 1 ] && fm_session_lock_foreign_owner_live "$STATE"; then
+if { [ "$CLAUDE_MODE" -eq 1 ] || [ "$CODEX_MODE" -eq 1 ]; } && fm_session_lock_foreign_owner_live "$STATE"; then
   printf '{"systemMessage":"FIRSTMATE SUPERVISION IS OWNED BY ANOTHER LIVE SESSION: this read-only session cannot and should not arm or repair the watcher (lock owner pid %s). Allowing this turn to end safely; the owning session must restore supervision."}\n' \
     "$FM_SESSION_LOCK_FOREIGN_OWNER_PID"
   exit 0
+fi
+
+if [ "$CODEX_MODE" -eq 1 ]; then
+  if [ -e "$STATE/.afk" ]; then
+    reason=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --harness codex --afk 1 \
+      --afk-mode "$(fm_afk_mode "$STATE")" --repair-line 2>/dev/null \
+      || printf '%s' 'Restore away/quiet supervision before ending the turn.')
+    printf 'FIRSTMATE CODEX TURN END REFUSED: %s\n' "$reason" >&2
+    exit 2
+  fi
+  printf '%s\n' 'FIRSTMATE CODEX TURN END REFUSED: a live checkpoint or yielded tool session does not guarantee post-turn supervision. Keep this turn open. If a checkpoint tool returned a running session id, wait on that exact session until it completes. Then drain and handle queued wakes with their required receipts, process inbox notes and mate outcomes, and start the next foreground checkpoint. Do not send a final response while supervision is needed. A repeated Stop refusal is not permission to leave work unattended.' >&2
+  exit 2
 fi
 
 if [ "$CLAUDE_MODE" -eq 0 ]; then

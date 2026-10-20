@@ -43,7 +43,8 @@ When the guard acts, the harness integration must do one of two things:
 - Block the turn end.
 - Force one bounded follow-up that uses the recovery instruction from the emitted session-start protocol.
 
-The mid-turn pull warning uses the model-aware supervision verdict described below, while the turn-end guard keeps the PID-strict watcher predicate.
+The mid-turn pull warning uses the model-aware supervision verdict described below.
+The turn-end guard keeps the PID-strict watcher predicate except in explicit Codex mode, where a live bounded checkpoint cannot prove post-turn continuation.
 
 Away and quiet mode are the one place the turn-end guard accepts a different supervisor.
 While `state/.afk` exists, in either mode (`bin/fm-wake-lib.sh`'s `fm_afk_mode`), the daemon owns supervision.
@@ -78,6 +79,7 @@ These sources also count toward supervision need:
 - Registered `state/procevent/*.source` records require supervision even though they have no task metadata.
 - Every mode treats `state/x-watch.check.sh` as supervision need, so Relay polling remains guarded without an in-flight task.
 - A custom check registered with `bin/fm-check-register.sh` counts the same way, so an operator's home-level poll keeps running after the last task is torn down.
+- Codex mode additionally protects queued wakes and unhandled inbox notes after the last task is removed, including a saved note whose announcement failed.
 
 The default cross-harness mode exits silently with no supervision need.
 
@@ -270,7 +272,7 @@ The registrations in detail:
   It records idle when it allows the Stop and busy when its exit 2 blocks it into a continuation, because Claude runs Stop hooks in parallel and that continuation fires no `UserPromptSubmit`.
   A home whose guard predates `.fm-busy-stop` cannot close the turn, so that launch keeps the ordinary `Stop` idle hook instead.
   [Runtime backend verification](verification/runtime-backends.md#secondmate-busy-contract) owns the live evidence.
-- Codex registers a `Stop` hook in `.codex/hooks.json`, anchors the executable to the hook process working directory, verifies a Firstmate-shaped hook-bearing root, and passes the original payload to the shared guard.
+- Codex registers a `Stop` hook in `.codex/hooks.json`, anchors the executable to the hook process working directory, verifies a Firstmate-shaped hook-bearing root, and passes the original payload to the shared guard with `--codex`.
 - OpenCode listens for `session.idle` in `.opencode/plugins/fm-primary-turnend-guard.js`, lets the watcher coordinator act first, and calls `client.session.promptAsync` once when the guard returns 2.
 - Pi listens for `agent_settled` in `.pi/extensions/fm-primary-turnend-guard.ts`, runs once per logical agent run, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })` once when the guard returns 2.
 - omp answers its blocking `session_stop` hook in `.omp/extensions/fm-primary-turnend-guard.ts`, passing the payload's own `stop_hook_active` to the shared guard.
@@ -306,7 +308,16 @@ The registrations in detail:
 
 Claude and Codex can block a Stop directly with exit status 2 and stderr.
 Both payloads carry `stop_hook_active`.
-In the default Codex mode, a true value lets the second stop finish after one forced continuation.
+Explicit Codex mode refuses every unsafe final while supervision is needed, including when that flag is true and a checkpoint is still live.
+Codex supports repeated native refusals; the flag is not a native one-block ceiling.
+The refusal directs the model to wait on its exact existing tool session until completion, handle and receipt-ACK wakes, and continue the existing foreground protocol.
+The guard starts no watcher, parks no hook, and adds no polling or callback mechanism.
+A verified away/quiet daemon can still own supervision, and a foreign live session lock retains its read-only diagnostic path.
+
+This prevents the unsafe final boundary while enabled, trusted hooks execute and Codex follows the foreground continuation.
+Disabled or untrusted hooks, an exited or intentionally cancelled session, and a model that does not follow the handling protocol do not acquire an automatic delivery guarantee.
+Readiness distinguishes a live consumer from ongoing continuation: `fm-inbox.sh ready` reports `foreground-continuation-unverified` for an attended Codex PID rather than inferring future handling from its current watcher.
+[Current native verification](verification/supervision.md#codex-unsafe-final-prevention) and `tests/fm-codex-continuity-live-e2e.test.sh` cover repeated refusal, late handoffs, receipt ACKs, ordinary Enter, and explicit quit.
 
 ### Claude cooperative mode
 

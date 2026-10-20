@@ -496,6 +496,30 @@ kill_holder
 trap fm_test_cleanup EXIT
 pass "readiness says unknown (or not-receivable) instead of inferring liveness from a lock"
 
+# A live foreground watcher proves present consumption, not a post-turn
+# callback. Readiness must not promote that weaker observation to a Codex SLA.
+home=$(make_home ready-codex-checkpoint)
+perl -e '$0="codex"; sleep 60' &
+holder_pid=$!
+printf '%s\n' "$holder_pid" > "$home/state/.lock"
+FM_HOME="$home" FM_POLL=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+  "$ROOT/bin/fm-watch.sh" > "$home/watcher.out" 2> "$home/watcher.err" &
+checkpoint_pid=$!
+trap 'kill "$checkpoint_pid" "$holder_pid" 2>/dev/null || true; wait "$checkpoint_pid" "$holder_pid" 2>/dev/null || true; fm_test_cleanup' EXIT
+for ((attempt=0; attempt<100; attempt++)); do
+  [ ! -s "$home/state/.watch.lock/pid" ] || { [ ! -e "$home/state/.last-watcher-beat" ] || break; }
+  sleep 0.1
+done
+ready=$(run_inbox "$home" ready) || fail "ready should inspect a live Codex foreground consumer"
+assert_equals "held" "$(printf '%s' "$ready" | json_get lock state)" "Codex lock is live"
+assert_equals "unknown" "$(printf '%s' "$ready" | json_get wake_consumer state)" "live Codex checkpoint does not prove future delivery"
+assert_equals "foreground-continuation-unverified" "$(printf '%s' "$ready" | json_get wake_consumer reason)" "readiness explains its uncertainty"
+assert_equals "unknown" "$(printf '%s' "$ready" | json_get can_receive)" "readiness cannot claim a continuation SLA"
+kill "$checkpoint_pid" "$holder_pid" 2>/dev/null || true
+wait "$checkpoint_pid" "$holder_pid" 2>/dev/null || true
+trap fm_test_cleanup EXIT
+pass "Codex readiness distinguishes a live consumer from proven post-turn continuation"
+
 # --- invalid input ----------------------------------------------------------
 
 home=$(make_home invalid)
