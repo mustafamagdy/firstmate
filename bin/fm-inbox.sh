@@ -890,11 +890,13 @@ cmd_ready() {
   # classify the lock-holder pid through fm-harness.sh ancestry. No holder,
   # or a walk that names nothing, is honest unknown - never the caller's
   # own harness, and never a durable per-home model record.
-  local resolved_model harness anc
+  local resolved_model harness=unknown anc
   resolved_model=${FM_SUPERVISION_MODEL:-}
-  if [ -z "$resolved_model" ] && [ "$lock_state" = held ] && [ -n "$lock_pid" ]; then
+  if [ "$lock_state" = held ] && [ -n "$lock_pid" ]; then
     anc=$("$SELF_DIR/fm-harness.sh" ancestry "$lock_pid" 2>/dev/null || true)
     harness=${anc#* }
+  fi
+  if [ -z "$resolved_model" ]; then
     case "$harness" in
       claude|cursor) resolved_model=autoarm ;;
       pi|pi-signed|omp) resolved_model=extension ;;
@@ -914,8 +916,13 @@ cmd_ready() {
       fm_watcher_supervision_verdict "$STATE" "$watch" "${FM_GUARD_GRACE:-300}" \
         "$FM_HOME" "$FM_ROOT"
     if [ "$FM_WATCHER_VERDICT_OK" = true ]; then
-      consumer_state=healthy
-      consumer_reason="supervised"
+      if [ "$harness" = codex ] && ! fm_afk_daemon_owns_supervision "$STATE"; then
+        consumer_state=unknown
+        consumer_reason="foreground-continuation-unverified"
+      else
+        consumer_state=healthy
+        consumer_reason="supervised"
+      fi
     elif [ "$FM_WATCHER_VERDICT_REASON" = no-watcher ]; then
       consumer_state=unknown
       consumer_reason="no-watcher"

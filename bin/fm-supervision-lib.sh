@@ -107,6 +107,20 @@ fm_supervision_status() {
   return 0
 }
 
+# fm_supervision_pending_handoffs <state-dir>
+# A Codex Stop also protects queued wakes and unhandled notes after the last
+# task is gone. Keep this separate from the ordinary watcher-need projection:
+# a pull-based drain already presents the queue and must not invent an extra
+# watcher-down episode solely because of the handoffs it is currently handling.
+fm_supervision_pending_handoffs() {
+  local state=$1 note
+  [ ! -s "$state/.wake-queue" ] || return 0
+  for note in "$state"/inbox/*.note; do
+    [ -f "$note" ] && return 0
+  done
+  return 1
+}
+
 # fm_supervision_needed <state-dir> [grace-seconds]
 # Exit 0 (true) exactly when the home needs a watcher.
 fm_supervision_needed() {

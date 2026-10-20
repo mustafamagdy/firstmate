@@ -603,6 +603,34 @@ ok - unacknowledged recovery is announced at most once per generation and the su
 FM_TEST_SUMMARY total=1 failed=0 skipped_gate=0 duration_ms=59357
 ```
 
+### Codex unsafe-final prevention
+
+Verified on 2026-10-20 with codex-cli 0.159.3 on Linux in named non-default Herdr labs.
+The installed native runtime invoked Stop with `stop_hook_active` false, true, true and honored each exit-2 refusal.
+The enabled-hook control returned exit 0 while a yielded checkpoint was still live; a topic request and mate outcome added after that process stopped remained unanswered.
+Explicit Codex mode refused the same unsafe finals, and the existing foreground continuation handled two late topic requests and a mate outcome exactly once, including after checkpoint expiration and after the watcher received TERM.
+The test verified two durable replies, inbox ACKs, an empty wake queue after the required generation/receipt ACKs, ordinary Enter submission without Escape, and explicit `/quit` with watcher cleanup.
+
+With the named lab helper overrides supplied in the environment where required, the refresh command is:
+
+```sh
+FM_CODEX_LIVE_E2E=1 bin/fm-test-run.sh tests/fm-codex-continuity-live-e2e.test.sh
+```
+
+Observed native results:
+
+```text
+harness: codex-cli 0.159.3
+ok - codex-cli 0.159.3: live-PID control ended blind and stranded both late handoffs
+ok - codex-cli 0.159.3: repeated unsafe finals refused; two late topics and mate outcome handled once with receipt ACKs (fixed)
+ok - codex-cli 0.159.3: repeated unsafe finals refused; two late topics and mate outcome handled once with receipt ACKs (failed-watcher)
+ok - codex-cli 0.159.3: ordinary Enter submits user input during foreground supervision; explicit /quit exits with watcher cleanup
+# all fm-codex-continuity live checks passed (codex-cli 0.159.3)
+```
+
+This verifies the [enabled-hook unsafe-final boundary](../turnend-guard.md#claude-and-codex-blocking) and actual foreground handling, not a background completion callback or delivery after explicit cancellation.
+The native run observed quiet checkpoints return 137; the unchanged wrapper's quiet-124 regression remains a separate limitation and was not converted into a success by this guard change.
+
 The Codex foreground-checkpoint behavior was exercised hermetically on 2026-09-14 with real watcher processes and isolated home state.
 That run observed an announced recovery remain announced through a quiet checkpoint, a never-announced generation surface once, and a durable wake appended during a live checkpoint resurface.
 Its announced-recovery fixture had no unacknowledged durable queue row, so it did not establish that the old behavior reproduced the regression; the revised counterfactual fixture and result are recorded separately below.

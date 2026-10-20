@@ -364,6 +364,84 @@ test_hook_silent_with_live_lock_and_fresh_beacon() {
   pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
 }
 
+test_codex_refuses_live_checkpoint_on_initial_and_repeated_stops() {
+  local dir pid identity out status active
+  dir=$(make_primary_dir "$TMP_ROOT/codex-live-checkpoint")
+  : > "$dir/state/task.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || fail "cannot identify live checkpoint holder"
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  for active in false true true; do
+    out=$(printf '{"stop_hook_active":%s}' "$active" | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1); status=$?
+    expect_code 2 "$status" "initial and repeated Codex finals cannot treat a live checkpoint as post-turn continuation"
+    assert_contains "$out" 'wait on that exact session' "Codex must continue the yielded tool session"
+    kill -0 "$pid" 2>/dev/null || fail "guard interfered with the checkpoint it must continue"
+    [ "$(cat "$dir/state/.watch.lock/pid")" = "$pid" ] || fail "guard replaced the existing singleton"
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  out=$(printf '{"stop_hook_active":true}' | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1); status=$?
+  expect_code 2 "$status" "a stopped checkpoint must also refuse a repeated unsafe final"
+  pass "Codex repeatedly refuses live or stopped checkpoints as post-turn proof without replacing the singleton"
+}
+
+test_codex_foreign_owner_remains_read_only() {
+  local dir holder active out status
+  dir=$(make_primary_dir "$TMP_ROOT/codex-foreign-owner")
+  : > "$dir/state/task.meta"
+  perl -e '$0="codex"; sleep 60' &
+  holder=$!
+  sleep 0.2
+  printf '%s\n' "$holder" > "$dir/state/.lock"
+  for active in false true; do
+    out=$(printf '{"stop_hook_active":%s}' "$active" | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1); status=$?
+    expect_code 0 "$status" "a foreign-owned Codex primary must remain read-only"
+    assert_contains "$out" 'OWNED BY ANOTHER LIVE SESSION' "foreign ownership must be explicit"
+    [ "$(cat "$dir/state/.lock")" = "$holder" ] || fail "read-only guard stole the session lock"
+  done
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  pass "Codex repeated Stop refusals do not steal a foreign live session lock"
+}
+
+test_codex_dead_away_and_quiet_keep_their_repair_path() {
+  local dir mode out status
+  dir=$(make_primary_dir "$TMP_ROOT/codex-away-quiet")
+  : > "$dir/state/task.meta"
+  for mode in away quiet; do
+    printf '%s\n' "$mode" > "$dir/state/.afk"
+    out=$(printf '{"stop_hook_active":true}' | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1); status=$?
+    expect_code 2 "$status" "Codex cannot allow idle with a dead away/quiet daemon"
+    if [ "$mode" = quiet ]; then
+      assert_contains "$out" 'load /quiet' "quiet repair must retain quiet ownership"
+    else
+      assert_contains "$out" 'load /afk' "away repair must retain away ownership"
+    fi
+    assert_not_contains "$out" 'start the next foreground checkpoint' "away/quiet repair must not start ordinary supervision"
+  done
+  pass "Codex repeated refusals preserve away and quiet daemon repair ownership"
+}
+
+test_pending_handoffs_require_supervision_without_tasks() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-pending-handoffs")
+  printf 'durable wake\n' > "$dir/state/.wake-queue"
+  out=$(printf '{"stop_hook_active":false}' | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1); status=$?
+  expect_code 2 "$status" "a queued handoff without tasks must prevent a blind stop"
+  rm "$dir/state/.wake-queue"
+  mkdir -p "$dir/state/inbox"
+  printf 'unannounced note\n' > "$dir/state/inbox/pending.note"
+  out=$(printf '{"stop_hook_active":false}' | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1); status=$?
+  expect_code 2 "$status" "an unannounced inbox note still needs a consumer"
+  mv "$dir/state/inbox/pending.note" "$dir/state/handled.note"
+  out=$(printf '{"stop_hook_active":false}' | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1); status=$?
+  expect_code 0 "$status" "a fully handled idle home may end"
+  [ -z "$out" ] || fail "idle Codex home unexpectedly emitted output"
+  pass "pending wakes and unannounced notes prevent idle blind stops until handled"
+}
+
 test_hook_non_claude_health_ignores_claude_budget_contention() {
   local dir home pid identity holder harness payload out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-non-claude-budget-contention")
@@ -2212,6 +2290,11 @@ test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_source_only_home
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_codex_refuses_live_checkpoint_on_initial_and_repeated_stops
+test_codex_foreign_owner_remains_read_only
+test_codex_dead_away_and_quiet_keep_their_repair_path
+test_pending_handoffs_require_supervision_without_tasks
+
 test_hook_non_claude_health_ignores_claude_budget_contention
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
