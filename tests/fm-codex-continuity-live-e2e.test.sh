@@ -21,7 +21,7 @@ cleanup() {
   local rc=$?
   [ -z "$HOME_DIR" ] || "$LAB_HOME_HELPER" teardown "$HOME_DIR" || rc=1
   "$HERDR_LAB_HELPER" teardown "$HERDR_LAB_SESSION" || rc=1
-  [ "$ARTIFACTS" != "$LAB/evidence" ] || rm -rf "$LAB"
+  rm -rf "$LAB"
   exit "$rc"
 }
 trap cleanup EXIT

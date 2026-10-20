@@ -388,12 +388,25 @@ test_codex_refuses_live_checkpoint_on_initial_and_repeated_stops() {
 }
 
 test_codex_foreign_owner_remains_read_only() {
-  local dir holder active out status
+  local dir holder active out status comm args attempt identity_ready=false
   dir=$(make_primary_dir "$TMP_ROOT/codex-foreign-owner")
   : > "$dir/state/task.meta"
   perl -e '$0="codex"; sleep 60' &
   holder=$!
-  sleep 0.2
+  for attempt in {1..50}; do
+    comm=$(ps -p "$holder" -o comm= 2>/dev/null || true)
+    args=$(ps -p "$holder" -o args= 2>/dev/null || true)
+    if [ "${comm##*/}" = codex ] || [ "${args%% *}" = codex ]; then
+      identity_ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$identity_ready" != true ]; then
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    fail "foreign owner fixture did not publish its Codex process identity"
+  fi
   printf '%s\n' "$holder" > "$dir/state/.lock"
   for active in false true; do
     out=$(printf '{"stop_hook_active":%s}' "$active" | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1); status=$?
